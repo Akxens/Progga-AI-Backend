@@ -14,6 +14,18 @@ export interface PlanInput {
   lesson?: StudiedLesson;
   /** "Start a lesson": teach this syllabus topic from scratch instead of answering a question */
   learn?: { topic: string; chapter?: string };
+  /** Innovation Lab: learn a skill by building a real project, step by step */
+  project?: LabBrief;
+}
+
+export interface LabBrief {
+  title: string;
+  /** what the student wants to learn, e.g. "HTML basics" */
+  skill: string;
+  /** the scenario and the real data to build with (a sample project), or the student's own idea */
+  brief: string;
+  /** the student described it themself, so the brief is their words, not ours */
+  custom?: boolean;
 }
 
 export interface SyllabusInput {

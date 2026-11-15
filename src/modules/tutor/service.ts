@@ -17,7 +17,7 @@ import {
   type SessionState,
 } from "./engine";
 import { tutorLLM, type TutorLLM } from "./llm";
-import type { PlanInput } from "./llm/types";
+import type { LabBrief, PlanInput } from "./llm/types";
 import { screenInput } from "./safety";
 import { evalPreview, planPreview, previewer, type OnPreview } from "./stream-preview";
 import type { Plan, StepProgress } from "./schemas";
@@ -141,6 +141,8 @@ export async function startSession(
     lessonId?: string;
     /** "Start a lesson": teach this topic of the chosen class's syllabus from scratch */
     learn?: { grade: number; topic: string; chapter?: string };
+    /** Innovation Lab: build this project to learn its skill */
+    project?: LabBrief;
   },
   /** live, word-by-word preview of Progga's opening while the AI writes it */
   onPreview?: OnPreview,
@@ -152,6 +154,10 @@ export async function startSession(
   const subject = lesson?.subject ?? input.subject;
   const learn = input.learn;
   if (learn) input = { ...input, question: user.language === "bn" ? `আমাকে শেখাও: ${learn.topic}` : `Teach me: ${learn.topic}` };
+  // a student's own project idea is their words, so it is screened like a question
+  const project = input.project;
+  if (project && !project.custom) input = { ...input, question: user.language === "bn" ? `প্রজেক্ট: ${project.title}` : `Project: ${project.title}` };
+  const teachFreely = !!learn || !!project;
 
   const startedToday = await prisma.tutorSession.count({
     where: { studentId, createdAt: { gte: dayStartUtc(dayKey()) } },
@@ -179,8 +185,9 @@ export async function startSession(
       image: input.image,
       lesson: lesson?.context,
       learn: learn && { topic: learn.topic, chapter: learn.chapter },
+      project: project && (project.custom ? { ...project, brief: screened.text } : project),
     },
-    previewer((json) => planPreview(json, { lesson: !!learn }), onPreview),
+    previewer((json) => planPreview(json, { lesson: teachFreely }), onPreview),
   );
 
   if (plan.safety !== "ok" || (plan.mode !== "fact" && plan.steps.length === 0)) {
@@ -199,7 +206,7 @@ export async function startSession(
       lessonId: lesson?.id,
       grade: profile.grade,
       mode: plan.mode,
-      kind: learn ? "lesson" : "question",
+      kind: project ? "project" : learn ? "lesson" : "question",
       language: user.language,
       // a fact is answered immediately, so the session is complete from the start
       status: plan.mode === "fact" ? "solved" : "active",
@@ -215,7 +222,7 @@ export async function startSession(
   await prisma.tutorMessage.create({
     data: { sessionId: session.id, role: "student", kind: "text", content: screened.text || (user.language === "bn" ? "📷 (প্রশ্নের ছবি পাঠিয়েছি)" : "📷 (sent a photo of the problem)") },
   });
-  await saveMessages(session.id, "tutor", openingMessages(plan, { lesson: !!learn }));
+  await saveMessages(session.id, "tutor", openingMessages(plan, { lesson: teachFreely }));
   return { blocked: false as const, session: await getSession(studentId, session.id) };
 }
 

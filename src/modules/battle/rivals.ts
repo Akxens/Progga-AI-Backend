@@ -2,29 +2,15 @@
 // Progga plays you itself under a typical Bangladeshi student name. The battle is
 // marked `isBot` in the database, so guardians and admins can always tell.
 
-const BOYS = [
-  "Rafi", "Tanvir", "Arif", "Sakib", "Nafis", "Rakib", "Fahim", "Mahin", "Ayaan", "Rayhan", "Siam", "Imran",
-  "Tahmid", "Shihab", "Nayeem", "Sabbir", "Rifat", "Fardin", "Zarif", "Ishraq", "Tamim", "Abrar", "Junaid", "Mehedi",
-  "Sajid", "Hasib", "Raihan", "Tasin", "Labib", "Adnan", "Shafin", "Arnob", "Pranto", "Sourav", "Anik", "Riyad",
-];
-const GIRLS = [
-  "Nusrat", "Ayesha", "Sadia", "Tasnim", "Farhana", "Mim", "Raisa", "Anika", "Sumaiya", "Lamia", "Nabila", "Tahsin",
-  "Jannat", "Maliha", "Samiha", "Orin", "Prova", "Nowshin", "Fariha", "Tanjila", "Afia", "Zara", "Ishita", "Rumana",
-  "Sanjida", "Mithila", "Purnota", "Adiba", "Labiba", "Rodela", "Nazia", "Meherin", "Tithi", "Bushra", "Shreya", "Anusha",
-];
-const SURNAMES = [
-  "Ahmed", "Hossain", "Rahman", "Islam", "Hasan", "Chowdhury", "Khan", "Akter", "Sarker", "Talukder", "Mia", "Uddin",
-  "Karim", "Siddique", "Haque", "Alam", "Begum", "Sultana", "Majumder", "Bhuiyan", "Molla", "Sheikh", "Das", "Roy",
-  "Saha", "Paul", "Biswas", "Barua", "Kabir", "Mahmud", "Jahan", "Ferdous", "Nahar", "Rashid", "Bari", "Mostafa",
-];
-const SKINS = ["classic", "mango", "mint", "ocean", "rose", "ninja", "galaxy", "gold"];
+import { makeName } from "./names";
+
+export const SKINS = ["classic", "mango", "mint", "ocean", "rose", "ninja", "galaxy", "gold"];
 
 const pick = <T>(arr: readonly T[]) => arr[Math.floor(Math.random() * arr.length)];
 
 export function rivalName(avoid?: string): string {
   for (;;) {
-    const first = Math.random() < 0.5 ? pick(BOYS) : pick(GIRLS);
-    const name = `${first} ${pick(SURNAMES)}`;
+    const { name } = makeName();
     if (name !== avoid) return name;
   }
 }

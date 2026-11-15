@@ -91,9 +91,17 @@ export function planText(input: PlanInput): string {
     profileBlock(input.profile),
     input.image ? "The student attached a photo of their question. Read it carefully and restate the problem in your intro." : "",
     input.lesson ? lessonBlock(input.lesson) : "",
-    input.learn
-      ? [`<start_lesson>`, `topic: ${input.learn.topic}`, input.learn.chapter ? `chapter: ${input.learn.chapter}` : "", `</start_lesson>`].filter(Boolean).join("\n")
-      : `<student_question>\n${input.question || "(see photo)"}\n</student_question>`,
+    input.project
+      ? [
+          `<lab_project${input.project.custom ? ` source="student"` : ""}>`,
+          `title: ${input.project.title}`,
+          `skill to learn: ${input.project.skill}`,
+          input.project.custom ? `the student's idea:\n${input.project.brief}` : `brief and real data:\n${input.project.brief}`,
+          `</lab_project>`,
+        ].join("\n")
+      : input.learn
+        ? [`<start_lesson>`, `topic: ${input.learn.topic}`, input.learn.chapter ? `chapter: ${input.learn.chapter}` : "", `</start_lesson>`].filter(Boolean).join("\n")
+        : `<student_question>\n${input.question || "(see photo)"}\n</student_question>`,
   ]
     .filter(Boolean)
     .join("\n\n");

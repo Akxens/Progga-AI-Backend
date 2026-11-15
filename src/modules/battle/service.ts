@@ -12,9 +12,10 @@ import { logger } from "../../lib/logger";
 import { XP } from "../gamification/catalog";
 import { levelFromXp } from "../gamification/levels";
 import { award } from "../gamification/service";
-import { LEAGUES, battleDifficulty, leagueFor, leagueView, trophyChange } from "./leagues";
+import { FAMILY_ORDER, LEAGUES, type LeagueFamily, battleDifficulty, familyRange, leagueFor, leagueView, trophyChange } from "./leagues";
+import { makeName, seededRandom } from "./names";
 import { BATTLE_SIZE, type BattleQuestion, buildBattleQuestions } from "./questions";
-import { type PlannedAnswer, planRival, rivalName, rivalSkin } from "./rivals";
+import { type PlannedAnswer, SKINS, planRival, rivalName, rivalSkin } from "./rivals";
 
 export const TIME_LIMIT_MS = 15_000;
 export const REVEAL_MS = 2_000; // pause after each answer to show right/wrong
@@ -403,7 +404,8 @@ async function finishBattle(battleId: string) {
     }
     const userId = me.p.userId;
     const profile = await profileFor(userId, b.grade);
-    const delta = trophyChange(profile.trophies, them.p.trophiesBefore, result);
+    // both sides use the pre-battle snapshot, so what one loses the other wins
+    const delta = trophyChange(me.p.trophiesBefore, them.p.trophiesBefore, result);
     const trophies = Math.max(0, profile.trophies + delta);
     const form = profile.winStreak;
     const nextForm = result === "win" ? Math.max(0, form) + 1 : result === "loss" ? Math.min(0, form) - 1 : 0;
@@ -604,4 +606,77 @@ export async function arenaHome(userId: string) {
       };
     }),
   };
+}
+
+/** Just the trophies and league, for profile cards. */
+export async function standing(userId: string) {
+  const user = await studentOrThrow(userId);
+  const profile = await profileFor(userId, user.grade);
+  const lv = leagueView(profile.trophies);
+  return { grade: user.grade, trophies: profile.trophies, bestTrophies: profile.bestTrophies, league: lv.league, next: lv.next, progress: lv.progress };
+}
+
+// ── League rosters ───────────────────────────────────────
+// Who's in each league of your class: real students who have played, plus a
+// steady crowd of practice rivals (the same Progga-played rivals you meet in
+// battles), seeded by class + league so names and trophies stay put.
+
+const RIVALS_PER_LEAGUE = 12;
+
+function leagueRivals(grade: number, family: LeagueFamily) {
+  const rand = seededRandom(`rivals:${grade}:${family}`);
+  const { min, max } = familyRange(family);
+  const tier = FAMILY_ORDER.indexOf(family);
+  const seen = new Set<string>();
+  return Array.from({ length: RIVALS_PER_LEAGUE }, (_, i) => {
+    let who = makeName(rand, i % 2 ? "girl" : "boy"); // even split of boys and girls
+    while (seen.has(who.name)) who = makeName(rand, who.gender);
+    seen.add(who.name);
+    const trophies = Math.round(min + rand() * (max - min));
+    return {
+      id: `rival-${grade}-${family}-${i}`,
+      name: shortName(who.name),
+      nameBn: who.nameBn,
+      gender: who.gender,
+      skin: SKINS[Math.floor(rand() * SKINS.length)],
+      level: 1 + tier * 8 + Math.floor(rand() * 10),
+      trophies,
+      isBot: true,
+      isMe: false,
+    };
+  });
+}
+
+export async function leagueRoster(userId: string, family: LeagueFamily) {
+  const user = await studentOrThrow(userId);
+  await profileFor(userId, user.grade); // make sure the student shows up in their own league
+  const { min, max } = familyRange(family);
+  const profiles = await prisma.battleProfile.findMany({
+    where: { grade: user.grade },
+    select: { userId: true, trophies: true, wins: true, losses: true, draws: true, user: { select: { name: true, avatarSkin: true, xp: true } } },
+  });
+  const active = profiles.filter((p) => p.userId === userId || p.wins + p.losses + p.draws > 0);
+
+  const counts = Object.fromEntries(FAMILY_ORDER.map((f) => [f, RIVALS_PER_LEAGUE])) as Record<LeagueFamily, number>;
+  for (const p of active) counts[leagueFor(p.trophies).family]++;
+
+  const students = active
+    .filter((p) => p.trophies >= min && p.trophies <= max)
+    .map((p) => ({
+      id: p.userId,
+      name: shortName(p.user.name),
+      nameBn: null as string | null,
+      gender: null as string | null,
+      skin: p.user.avatarSkin,
+      level: levelFromXp(p.user.xp),
+      trophies: p.trophies,
+      isBot: false,
+      isMe: p.userId === userId,
+    }));
+
+  const players = [...students, ...leagueRivals(user.grade, family)]
+    .sort((a, b) => b.trophies - a.trophies)
+    .map((p, i) => ({ ...p, rank: i + 1, leagueId: leagueFor(p.trophies).id }));
+
+  return { grade: user.grade, family, min, max, counts, players };
 }

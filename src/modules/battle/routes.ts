@@ -2,7 +2,8 @@ import { Router } from "express";
 import rateLimit from "express-rate-limit";
 import { z } from "zod";
 import { authed, requireAuth, requireRole } from "../../middleware/auth";
-import { answer, arenaHome, battleState, cancelSearch, pollSearch, startSearch } from "./service";
+import { FAMILY_ORDER, type LeagueFamily } from "./leagues";
+import { answer, arenaHome, battleState, cancelSearch, leagueRoster, pollSearch, standing, startSearch } from "./service";
 
 export const battleRouter = Router();
 battleRouter.use(requireAuth, requireRole("STUDENT"));
@@ -21,6 +22,17 @@ battleRouter.use(
 
 battleRouter.get("/arena", async (req, res) => {
   res.json(await arenaHome(authed(req).id));
+});
+
+/** Trophies + league badge for the profile card. */
+battleRouter.get("/standing", async (req, res) => {
+  res.json(await standing(authed(req).id));
+});
+
+/** Everyone in one league of the student's class (students + practice rivals). */
+battleRouter.get("/leagues/:family", async (req, res) => {
+  const family = z.enum(FAMILY_ORDER as [LeagueFamily, ...LeagueFamily[]]).parse(req.params.family);
+  res.json(await leagueRoster(authed(req).id, family));
 });
 
 battleRouter.post("/search", async (req, res) => {

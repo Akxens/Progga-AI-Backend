@@ -16,6 +16,7 @@ export const Birthdate = z.iso
 
 export const ProfilePatch = z
   .object({
+    nickname: text(24), // shown on profile cards instead of the full name
     bio: text(300),
     dream: text(60), // students: "When I grow up I want to be…"
     schoolName: text(120), // students: their school · teachers: their institution

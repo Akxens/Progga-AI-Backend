@@ -65,12 +65,13 @@ describe("battle questions", () => {
 describe("leagues & trophies", () => {
   it("has the full ladder in order", () => {
     expect(LEAGUES[0].id).toBe("unranked");
-    expect(LEAGUES.at(-1)!.id).toBe("legend");
+    expect(LEAGUES.at(-1)!.id).toBe("legend-1");
     for (let i = 1; i < LEAGUES.length; i++) expect(LEAGUES[i].min).toBeGreaterThan(LEAGUES[i - 1].min);
     expect(leagueFor(399).id).toBe("unranked");
     expect(leagueFor(400).name).toBe("Bronze League III");
     expect(leagueFor(1250).name).toBe("Silver League I");
-    expect(leagueFor(9999).id).toBe("legend");
+    expect(leagueFor(5000).name).toBe("Legend League III");
+    expect(leagueFor(9999).id).toBe("legend-1");
   });
 
   it("gets harder as you climb", () => {
@@ -79,12 +80,20 @@ describe("leagues & trophies", () => {
     expect(battleDifficulty(3300)).toBe(6);
   });
 
-  it("pays about +30 / −20 between equals and never goes below zero", () => {
+  it("moves ±30 between equals, pays more for an upset, and never goes below zero", () => {
     expect(trophyChange(1000, 1000, "win")).toBe(30);
-    expect(trophyChange(1000, 1000, "loss")).toBeLessThan(-15);
+    expect(trophyChange(1000, 1000, "loss")).toBe(-30);
     expect(trophyChange(1000, 1400, "win")).toBeGreaterThan(30);
-    expect(trophyChange(10, 10, "loss")).toBeGreaterThanOrEqual(-10);
+    expect(trophyChange(1400, 1000, "win")).toBeLessThan(30);
+    expect(trophyChange(10, 10, "loss")).toBe(-10);
     expect(trophyChange(1000, 1000, "draw")).toBe(0);
+  });
+
+  it("hands the loser's trophies to the winner (zero-sum)", () => {
+    for (const [winner, loser] of [[1000, 1000], [800, 1500], [2600, 1200], [0, 3000], [4000, 4100]]) {
+      expect(trophyChange(winner, loser, "win") + trophyChange(loser, winner, "loss")).toBe(0);
+    }
+    expect(trophyChange(5000, 0, "win")).toBeGreaterThanOrEqual(1); // the loser had nothing to give, the winner still scores
   });
 });
 

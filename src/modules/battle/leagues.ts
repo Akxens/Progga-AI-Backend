@@ -1,13 +1,13 @@
 // Battle Arena leagues. Every class has its own ladder: a Class 8 student only
 // meets Class 8 rivals and climbs the Class 8 league. Trophy thresholds follow
-// the classic trophy-road layout (Bronze III at 400 … Legend at 5000).
+// the classic trophy-road layout (Bronze III at 400 … Legend I at 6000).
 
 export type LeagueFamily = "unranked" | "bronze" | "silver" | "gold" | "crystal" | "master" | "champion" | "titan" | "legend";
 
 export interface League {
   id: string; // bronze-3
   family: LeagueFamily;
-  division: 0 | 1 | 2 | 3; // III = 3 (entry) … I = 1; 0 for Unranked/Legend
+  division: 0 | 1 | 2 | 3; // III = 3 (entry) … I = 1; 0 for Unranked
   name: string; // "Bronze League III"
   min: number; // trophies needed
   difficulty: number; // 1..6 — how hard the battle questions are
@@ -22,6 +22,7 @@ const FAMILIES: [LeagueFamily, string, number[], number][] = [
   ["master", "Master", [2600, 2800, 3000], 5],
   ["champion", "Champion", [3200, 3500, 3800], 6],
   ["titan", "Titan", [4100, 4400, 4700], 6],
+  ["legend", "Legend", [5000, 5500, 6000], 6],
 ];
 
 const ROMAN = ["", "I", "II", "III"] as const;
@@ -34,8 +35,16 @@ export const LEAGUES: League[] = [
       return { id: `${family}-${division}`, family, division, name: `${name} League ${ROMAN[division]}`, min, difficulty };
     }),
   ),
-  { id: "legend", family: "legend", division: 0, name: "Legend League", min: 5000, difficulty: 6 },
 ];
+
+export const FAMILY_ORDER: LeagueFamily[] = ["unranked", "bronze", "silver", "gold", "crystal", "master", "champion", "titan", "legend"];
+
+/** Trophy span of a whole league family (all its divisions). Legend has no ceiling, so it gets a soft one. */
+export function familyRange(family: LeagueFamily): { min: number; max: number } {
+  const own = LEAGUES.filter((l) => l.family === family);
+  const after = LEAGUES.find((l) => l.min > own[own.length - 1].min);
+  return { min: own[0].min, max: after ? after.min - 1 : own[own.length - 1].min + 1200 };
+}
 
 export function leagueFor(trophies: number): League {
   let league = LEAGUES[0];
@@ -53,35 +62,27 @@ export function battleDifficulty(...trophies: number[]): number {
   return leagueFor(avg).difficulty;
 }
 
-/** Losing hurts less while you're finding your feet. */
-const LOSS_FACTOR: Record<LeagueFamily, number> = {
-  unranked: 0.5,
-  bronze: 0.75,
-  silver: 0.9,
-  gold: 1,
-  crystal: 1,
-  master: 1,
-  champion: 1,
-  titan: 1,
-  legend: 1,
-};
-
 const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v));
 
 /**
- * Trophies won or lost. Beating a stronger rival pays more; losing to a weaker
- * one costs more. Equal rivals: about +30 for a win, −20 for a loss.
+ * Trophies at stake when `winner` beats `loser`: the loser hands exactly this
+ * many to the winner. Equal rivals: 30. Beating a much stronger rival pays up
+ * to 59; beating a much weaker one pays as little as 1.
+ */
+export function trophyStake(winner: number, loser: number): number {
+  const expected = 1 / (1 + 10 ** ((loser - winner) / 400));
+  return clamp(Math.round(60 * (1 - expected)), 1, 59);
+}
+
+/**
+ * Trophy change for one player, worked out from both players' trophies before
+ * the battle so the two sides always mirror each other (+N for the winner, −N
+ * for the loser). A loser can't drop below zero; the winner still gets the full stake.
  */
 export function trophyChange(mine: number, theirs: number, result: "win" | "loss" | "draw"): number {
   if (result === "draw") return 0;
-  const expected = 1 / (1 + 10 ** ((theirs - mine) / 400));
-  const family = leagueFor(mine).family;
-  if (result === "win") {
-    const gain = clamp(Math.round(10 + 40 * (1 - expected)), 12, 45);
-    return family === "unranked" ? Math.round(gain * 1.4) : gain;
-  }
-  const loss = clamp(Math.round((6 + 28 * expected) * LOSS_FACTOR[family]), 4, 35);
-  return -Math.min(loss, mine); // never below zero
+  if (result === "win") return trophyStake(mine, theirs);
+  return -Math.min(trophyStake(theirs, mine), mine);
 }
 
 /** What a student sees about a league (and their place in it). */
