@@ -93,7 +93,18 @@ export function evalPreview(json: string, secrets: string[]): PreviewMessage[] {
     if (writing) shown = raw.slice(0, Math.max(0, raw.length - Math.max(0, ...secrets.map((s) => s.length * 2 + 4))));
   }
   const content = settled(shown, writing);
-  return content ? [{ kind: "feedback", content, meta: { verdict: e.verdict } }] : [];
+  const out: PreviewMessage[] = content ? [{ kind: "feedback", content, meta: { verdict: e.verdict } }] : [];
+
+  // then the breakdown written for this mistake, streamed the same careful way
+  if (!writing && typeof e.breakdown === "string" && e.breakdown) {
+    const teaching = !done(["breakdown"]);
+    if (!secrets.some((s) => leaksAnswer(e.breakdown as string, s))) {
+      const held = teaching ? e.breakdown.slice(0, Math.max(0, e.breakdown.length - Math.max(0, ...secrets.map((s) => s.length * 2 + 4)))) : e.breakdown;
+      const text = settled(held, teaching);
+      if (text) out.push({ kind: "teach", content: text, meta: { adaptive: true } });
+    }
+  }
+  return out;
 }
 
 /** Turns streamed JSON into preview updates, sending one only when what the student sees changes. */

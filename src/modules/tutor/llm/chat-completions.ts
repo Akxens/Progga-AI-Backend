@@ -188,7 +188,9 @@ export class ChatCompletionsTutor implements TutorLLM {
       ...(onPartial ? { stream: true } : {}),
     };
     if (reasoning && !noReasoning.has(model)) body.reasoning_effort = reasoning;
-    logger.debug({ provider: this.name, model, task: messages[0].content === EVAL_SYSTEM ? "check" : "plan" }, "AI call");
+    const task = messages[0].content === EVAL_SYSTEM ? "check" : "plan";
+    const started = Date.now();
+    let firstTokenMs: number | undefined;
 
     let res: Response;
     try {
@@ -230,6 +232,7 @@ export class ChatCompletionsTutor implements TutorLLM {
         const choice = (JSON.parse(payload) as StreamChunk).choices?.[0];
         if (choice?.finish_reason === "content_filter" || choice?.delta?.refusal) filtered = true;
         if (choice?.delta?.content) {
+          firstTokenMs ??= Date.now() - started;
           streamed += choice.delta.content;
           onPartial(streamed);
         }
@@ -240,6 +243,8 @@ export class ChatCompletionsTutor implements TutorLLM {
       filtered = choice?.finish_reason === "content_filter" || !!choice?.message?.refusal;
       content = choice?.message?.content;
     }
+    // how long Progga took to think: first words (what the student waits for) and the whole answer
+    logger.debug({ provider: this.name, model, task, reasoning: body.reasoning_effort, firstTokenMs, totalMs: Date.now() - started, chars: content?.length ?? 0 }, "AI call");
     if (filtered) throw new FilteredError("filtered");
     if (!content) throw new HttpError(502, "Progga got a bit confused. Please try again!", "llm_empty");
     return content;

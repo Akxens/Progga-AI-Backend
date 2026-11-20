@@ -52,6 +52,12 @@ export const PlanSchema = z.object({
 export const EvalSchema = z.object({
   verdict: z.enum(["correct", "partial", "incorrect", "stuck", "asks_for_answer", "question", "off_topic", "wellbeing"]),
   feedback: z.string().describe("1-3 short sentences reacting to the student's reply. Never reveals the step answer or final answer."),
+  breakdown: z
+    .string()
+    .describe(
+      "Only for incorrect or partial: a short teaching breakdown (2-5 sentences, or a few bullet points) built around THIS student's mistake: the idea they are missing, explained more deeply and simply, with a tiny example on a similar but different case. Never contains this step's answer. Empty string otherwise.",
+    )
+    .optional(),
   follow_up: z.string().describe("When not correct: a smaller guiding question that moves the student forward. Empty string when correct."),
   misconception: z.string().describe("Short internal note of the misconception, for the teacher dashboard. Empty if none."),
 });

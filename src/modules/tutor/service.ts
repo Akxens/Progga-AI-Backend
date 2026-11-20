@@ -84,16 +84,27 @@ async function loadOwned(studentId: string, id: string) {
   return s;
 }
 
-async function saveMessages(sessionId: string, role: "student" | "tutor", msgs: OutMessage[]) {
-  const created = [];
-  for (const m of msgs) {
-    created.push(
-      await prisma.tutorMessage.create({
-        data: { sessionId, role, kind: m.kind, content: m.content, stepIndex: m.stepIndex, meta: (m.meta ?? undefined) as Prisma.InputJsonValue },
+/**
+ * Saves a turn's messages all at once (the database is far away, so every round trip
+ * counts; a batch insert would add BEGIN/COMMIT trips). Each gets its own createdAt,
+ * a millisecond apart, so they keep their order.
+ */
+async function saveMessages(sessionId: string, role: "student" | "tutor", msgs: OutMessage[], base = Date.now()) {
+  return Promise.all(
+    msgs.map((m, i) =>
+      prisma.tutorMessage.create({
+        data: {
+          sessionId,
+          role,
+          kind: m.kind,
+          content: m.content,
+          stepIndex: m.stepIndex,
+          meta: (m.meta ?? undefined) as Prisma.InputJsonValue,
+          createdAt: new Date(base + i),
+        },
       }),
-    );
-  }
-  return created;
+    ),
+  );
 }
 
 async function persistState(id: string, state: SessionState, xpGained: number) {
@@ -149,8 +160,12 @@ export async function startSession(
   /** the engine the student picked (default: the admin's choice) */
   llm: TutorLLM = tutorLLM,
 ) {
-  const user = await prisma.user.findUniqueOrThrow({ where: { id: studentId } });
-  const lesson = input.lessonId ? await studiedLesson(input.lessonId) : null;
+  // independent lookups run together: each one is a trip to the database
+  const [user, lesson, startedToday] = await Promise.all([
+    prisma.user.findUniqueOrThrow({ where: { id: studentId } }),
+    input.lessonId ? studiedLesson(input.lessonId) : null,
+    prisma.tutorSession.count({ where: { studentId, createdAt: { gte: dayStartUtc(dayKey()) } } }),
+  ]);
   const subject = lesson?.subject ?? input.subject;
   const learn = input.learn;
   if (learn) input = { ...input, question: user.language === "bn" ? `আমাকে শেখাও: ${learn.topic}` : `Teach me: ${learn.topic}` };
@@ -159,9 +174,6 @@ export async function startSession(
   if (project && !project.custom) input = { ...input, question: user.language === "bn" ? `প্রজেক্ট: ${project.title}` : `Project: ${project.title}` };
   const teachFreely = !!learn || !!project;
 
-  const startedToday = await prisma.tutorSession.count({
-    where: { studentId, createdAt: { gte: dayStartUtc(dayKey()) } },
-  });
   if (startedToday >= user.dailyTutorLimit) {
     throw tooMany(
       user.language === "bn"
@@ -219,11 +231,22 @@ export async function startSession(
     },
   });
 
-  await prisma.tutorMessage.create({
-    data: { sessionId: session.id, role: "student", kind: "text", content: screened.text || (user.language === "bn" ? "📷 (প্রশ্নের ছবি পাঠিয়েছি)" : "📷 (sent a photo of the problem)") },
-  });
-  await saveMessages(session.id, "tutor", openingMessages(plan, { lesson: teachFreely }));
-  return { blocked: false as const, session: await getSession(studentId, session.id) };
+  // the question and Progga's opening are saved together; timestamps keep the question first
+  const now = Date.now();
+  const [asked, opening] = await Promise.all([
+    saveMessages(
+      session.id,
+      "student",
+      [{ kind: "text", content: screened.text || (user.language === "bn" ? "📷 (প্রশ্নের ছবি পাঠিয়েছি)" : "📷 (sent a photo of the problem)"), stepIndex: undefined }],
+      now,
+    ),
+    saveMessages(session.id, "tutor", openingMessages(plan, { lesson: teachFreely }), now + 1),
+  ]);
+  // a brand-new chat holds exactly these messages, so there's nothing to read back
+  return {
+    blocked: false as const,
+    session: { ...publicView(session), lesson: lesson && { id: lesson.id, title: lesson.context.title }, messages: [...asked, ...opening].map(publicMessage) },
+  };
 }
 
 /** Removes a chat and everything in it (messages, saved voice clips). XP already earned is kept. */
@@ -271,9 +294,13 @@ export async function syllabus(grade: number, subjectId: string, language: strin
 }
 
 export async function getSession(studentId: string, id: string) {
-  const s = await loadOwned(studentId, id);
+  return sessionView(await loadOwned(studentId, id));
+}
+
+/** The public session with its messages, for a session row we already have. */
+async function sessionView(s: TutorSession) {
   const [messages, lesson] = await Promise.all([
-    prisma.tutorMessage.findMany({ where: { sessionId: id }, orderBy: { createdAt: "asc" } }),
+    prisma.tutorMessage.findMany({ where: { sessionId: s.id }, orderBy: { createdAt: "asc" } }),
     s.lessonId ? prisma.lesson.findUnique({ where: { id: s.lessonId }, select: { id: true, title: true } }) : null,
   ]);
   return { ...publicView(s), lesson, messages: messages.map(publicMessage) };
@@ -325,13 +352,16 @@ async function inLanguage(s: TutorSession, language: string, llm: TutorLLM = tut
 }
 
 export async function reply(studentId: string, id: string, raw: string, onPreview?: OnPreview, llm: TutorLLM = tutorLLM): Promise<ActionResult> {
-  let s = await loadOwned(studentId, id);
+  let [s, user] = await Promise.all([loadOwned(studentId, id), prisma.user.findUniqueOrThrow({ where: { id: studentId } })]);
   if (s.status !== "active") throw badRequest("This adventure is finished — start a new one!");
-  const user = await prisma.user.findUniqueOrThrow({ where: { id: studentId } });
   s = await inLanguage(s, user.language, llm);
 
   const screened = screenInput(raw, user.language);
-  const studentMsg = await saveMessages(id, "student", [{ kind: "text", content: screened.text, stepIndex: s.currentStep }]);
+  // store the reply while reading the conversation so far (both are trips to the database)
+  const [studentMsg, earlier] = await Promise.all([
+    saveMessages(id, "student", [{ kind: "text", content: screened.text, stepIndex: s.currentStep }]),
+    prisma.tutorMessage.findMany({ where: { sessionId: id }, orderBy: { createdAt: "desc" }, take: RECENT_MESSAGES + 1 }),
+  ]);
 
   if (!screened.ok) {
     await logSafety(studentId, screened.category, screened.text);
@@ -341,7 +371,8 @@ export async function reply(studentId: string, id: string, raw: string, onPrevie
 
   const state = toState(s);
   const step = state.plan.steps[state.currentStep];
-  const recent = await prisma.tutorMessage.findMany({ where: { sessionId: id }, orderBy: { createdAt: "desc" }, take: RECENT_MESSAGES + 1 });
+  // the read may or may not have seen the reply just stored: leave it out either way
+  const recent = earlier.filter((m) => m.id !== studentMsg[0].id).slice(0, RECENT_MESSAGES);
   const evaluation = soundsStuck(screened.text)
     ? { verdict: "stuck" as const, feedback: "", follow_up: "", misconception: "" }
     : await llm.evaluate(
@@ -352,7 +383,6 @@ export async function reply(studentId: string, id: string, raw: string, onPrevie
           stepIndex: state.currentStep,
           step,
           recent: recent
-            .slice(1) // skip the reply we just stored
             .reverse()
             .map((m) => ({ role: m.role as "student" | "tutor", content: m.content })),
           reply: screened.text,
@@ -365,11 +395,13 @@ export async function reply(studentId: string, id: string, raw: string, onPrevie
 
   const gained = t.xp.reduce((sum, e) => sum + e.amount, 0);
   const outgoing = await withVideos(s, t.messages);
-  await persistState(id, t.state, gained);
-  const tutorMsgs = await saveMessages(id, "tutor", outgoing);
-  const rewards = t.xp.length ? await award(studentId, t.xp.map((e) => ({ ...e, refId: id })), { hintFreeSolve: t.hintFreeSolve }) : null;
+  const [updated, tutorMsgs] = await Promise.all([persistState(id, t.state, gained), saveMessages(id, "tutor", outgoing)]);
+  const [rewards, session] = await Promise.all([
+    t.xp.length ? award(studentId, t.xp.map((e) => ({ ...e, refId: id })), { hintFreeSolve: t.hintFreeSolve }) : null,
+    sessionView(updated),
+  ]);
 
-  return { session: await getSession(studentId, id), newMessages: [...studentMsg, ...tutorMsgs].map(publicMessage), rewards };
+  return { session, newMessages: [...studentMsg, ...tutorMsgs].map(publicMessage), rewards };
 }
 
 export async function hint(studentId: string, id: string): Promise<ActionResult> {

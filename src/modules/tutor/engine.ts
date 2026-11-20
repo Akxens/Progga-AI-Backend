@@ -233,9 +233,17 @@ export function applyEvaluation(prev: SessionState, ev: Evaluation, lang = "en")
         state.wrongAttempts++;
       }
       messages.push({ kind: "feedback", content: safe(ev.feedback), stepIndex: i, meta: { verdict: ev.verdict, misconception: ev.misconception || undefined } });
+      // a breakdown written for THIS mistake: it teaches the missing idea before the next, smaller question
+      const breakdown = ev.breakdown?.trim() ? safe(ev.breakdown) : "";
+      if (breakdown) messages.push({ kind: "teach", content: breakdown, stepIndex: i, meta: { adaptive: true } });
       if (ev.verdict === "incorrect" && p.wrong >= TEACH_AFTER_WRONG) {
-        hintFreeSolve = help(state, messages, xp, lang);
-        break;
+        if (!breakdown || (p.helped ?? 0) > 0) {
+          hintFreeSolve = help(state, messages, xp, lang);
+          break;
+        }
+        // the tailored breakdown stands in for the plan's general explanation this time
+        p.helped = 1;
+        state.hintsUsed++;
       }
       const suggestHint = p.wrong >= SUGGEST_HINT_AFTER && p.hintsShown < step.hints.length;
       if (ev.follow_up) messages.push({ kind: "question", content: safe(ev.follow_up), stepIndex: i, meta: { suggestHint } });
