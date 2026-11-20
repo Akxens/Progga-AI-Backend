@@ -17,6 +17,8 @@ import { gamificationRouter } from "./modules/gamification/routes";
 import { guardianRouter } from "./modules/guardian/routes";
 import { battleRouter } from "./modules/battle/routes";
 import { labRouter } from "./modules/lab/routes";
+import { requireFeature } from "./modules/features/config";
+import { featuresAdminRouter, featuresRouter } from "./modules/features/routes";
 import { tutorLLM } from "./modules/tutor/llm";
 import { aiAdminRouter } from "./modules/ai/routes";
 import { loadAiConfig } from "./modules/ai/config";
@@ -65,10 +67,12 @@ export function createApp() {
   app.use("/api/quiz", quizRouter);
   app.use("/api/game", gamificationRouter);
   app.use("/api/guardian", guardianRouter);
-  app.use("/api/battle", battleRouter);
-  app.use("/api/lab", labRouter);
+  app.use("/api/features", featuresRouter);
+  app.use("/api/battle", requireFeature("battle"), battleRouter);
+  app.use("/api/lab", requireFeature("lab"), labRouter);
   app.use("/api/admin/ai", aiAdminRouter);
   app.use("/api/admin/voice", voiceAdminRouter);
+  app.use("/api/admin/features", featuresAdminRouter);
 
   app.use(notFoundHandler);
   app.use(errorHandler);
