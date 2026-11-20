@@ -189,6 +189,8 @@ export async function saveVoiceConfig(cfg: VoiceConfig) {
 export interface SpeechAudio {
   contentType: string;
   chunks: AsyncIterable<Uint8Array>;
+  /** fixes up the whole clip before it is saved (e.g. a streamed WAV's placeholder sizes) */
+  finalize?: (whole: Buffer) => Buffer;
 }
 
 /** How Progga should sound: a kid, so students hear a friend learning alongside them rather than a teacher. */
@@ -254,26 +256,66 @@ function wavHeader(dataBytes: number): Buffer {
   return h;
 }
 
+/** A streamed WAV doesn't know its length yet: these placeholder sizes mean "until the stream ends". */
+const STREAM_BYTES = 0x7fffffff;
+
+/** Writes the real sizes into a finished streamed WAV, so the saved copy is a normal file. */
+function fixWavSizes(whole: Buffer): Buffer {
+  if (whole.length < 44 || whole.toString("latin1", 0, 4) !== "RIFF") return whole;
+  const out = Buffer.from(whole);
+  out.writeUInt32LE(out.length - 8, 4);
+  out.writeUInt32LE(out.length - 44, 40);
+  return out;
+}
+
 /**
  * Realtime models (e.g. gpt-realtime-2.1-mini) don't work with /audio/speech: they speak over a
- * WebSocket session. We ask them to read the text verbatim and wrap the PCM they send as a WAV.
+ * WebSocket session. We ask them to read the text verbatim and stream the PCM they send as a WAV,
+ * so Progga starts talking as soon as the first words arrive instead of after the whole clip.
  */
 function openaiRealtimeSpeech(text: string, lang: SpeechLang, voice: string): Promise<SpeechAudio> {
   const url = `${env.OPENAI_BASE_URL.replace(/^http/, "ws")}/realtime?model=${encodeURIComponent(env.OPENAI_TTS_MODEL)}`;
   return new Promise((resolve, reject) => {
-    const pcm: Buffer[] = [];
-    let settled = false;
+    // audio pieces waiting to be read, and the reader waiting for the next piece
+    const pending: Buffer[] = [];
+    let wake: (() => void) | null = null;
+    let ended = false;
+    let failure: Error | null = null;
+    let started = false;
+    const notify = () => {
+      wake?.();
+      wake = null;
+    };
+
     // the API key goes in a subprotocol: WebSocket clients can't set an Authorization header
     const ws = new WebSocket(url, ["realtime", `openai-insecure-api-key.${env.OPENAI_API_KEY}`]);
-    const fail = (detail: string, timeout = false) => {
-      if (settled) return;
-      settled = true;
+    const finish = () => {
       clearTimeout(timer);
-      logger.error({ engine: "OpenAI realtime", model: env.OPENAI_TTS_MODEL, detail: detail.slice(0, 300) }, "TTS API error");
+      ended = true;
       ws.close();
-      reject(timeout ? new HttpError(503, "Progga's voice is taking a nap. Please try again.", "tts_timeout") : unavailable("OpenAI"));
+      notify();
     };
-    const timer = setTimeout(() => fail("timed out", true), 45_000);
+    const fail = (detail: string, timeout = false) => {
+      if (ended) return;
+      logger.error({ engine: "OpenAI realtime", model: env.OPENAI_TTS_MODEL, detail: detail.slice(0, 300) }, "TTS API error");
+      failure = timeout ? new HttpError(503, "Progga's voice is taking a nap. Please try again.", "tts_timeout") : unavailable("OpenAI");
+      finish();
+      if (!started) reject(failure);
+    };
+    const timer = setTimeout(() => fail("timed out", true), 60_000);
+
+    async function* chunks(): AsyncIterable<Uint8Array> {
+      yield wavHeader(STREAM_BYTES);
+      for (;;) {
+        if (pending.length) {
+          yield pending.shift()!;
+          continue;
+        }
+        if (failure) throw failure; // cut off mid-clip: don't let a partial clip be saved
+        if (ended) return;
+        await new Promise<void>((r) => (wake = r));
+      }
+    }
 
     ws.onopen = () => {
       const instructions =
@@ -299,21 +341,23 @@ function openaiRealtimeSpeech(text: string, lang: SpeechLang, voice: string): Pr
       } catch {
         return;
       }
-      if (e.type === "response.output_audio.delta" || e.type === "response.audio.delta") pcm.push(Buffer.from(e.delta ?? "", "base64"));
-      else if (e.type === "error") fail(JSON.stringify(e.error));
+      if (e.type === "response.output_audio.delta" || e.type === "response.audio.delta") {
+        pending.push(Buffer.from(e.delta ?? "", "base64"));
+        if (!started) {
+          // first words are here: start sending audio to the browser
+          started = true;
+          resolve({ contentType: "audio/wav", chunks: chunks(), finalize: fixWavSizes });
+        }
+        notify();
+      } else if (e.type === "error") fail(JSON.stringify(e.error));
       else if (e.type === "response.done") {
-        if (e.response?.status !== "completed" || !pcm.length) return fail(`response ${e.response?.status}: ${JSON.stringify(e.response?.status_details ?? "")}`);
-        settled = true;
-        clearTimeout(timer);
-        ws.close();
-        const data = Buffer.concat(pcm);
-        const wav = Buffer.concat([wavHeader(data.length), data]);
-        resolve({ contentType: "audio/wav", chunks: (async function* () { yield wav; })() });
+        if (e.response?.status !== "completed" || !started) return fail(`response ${e.response?.status}: ${JSON.stringify(e.response?.status_details ?? "")}`);
+        finish();
       }
     };
     ws.onerror = () => fail("websocket error");
     ws.onclose = (ev) => {
-      if (!settled) fail(`closed ${ev.code} ${ev.reason}`);
+      if (!ended) fail(`closed ${ev.code} ${ev.reason}`);
     };
   });
 }

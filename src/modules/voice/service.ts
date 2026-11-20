@@ -141,12 +141,19 @@ const audioType = (audio: Uint8Array) => (Buffer.from(audio.subarray(0, 4)).toSt
 async function pipeAudio(speech: SpeechAudio, res: ExpressResponse): Promise<Uint8Array<ArrayBuffer>> {
   res.set("Content-Type", speech.contentType);
   const chunks: Uint8Array[] = [];
-  for await (const chunk of speech.chunks) {
-    chunks.push(chunk);
-    if (!res.destroyed) res.write(chunk); // keep collecting even if the student navigated away
+  try {
+    for await (const chunk of speech.chunks) {
+      chunks.push(chunk);
+      if (!res.destroyed) res.write(chunk); // keep collecting even if the student navigated away
+    }
+  } catch (err) {
+    // the engine stopped mid-clip after audio was already sent: end the response, save nothing
+    if (res.headersSent) res.destroy();
+    throw err;
   }
   if (!res.destroyed) res.end();
-  return Uint8Array.from(Buffer.concat(chunks));
+  const whole = Buffer.concat(chunks);
+  return Uint8Array.from(speech.finalize ? speech.finalize(whole) : whole);
 }
 
 /** Admin preview: speak any sample text with a voice before switching to it (nothing is saved). */
