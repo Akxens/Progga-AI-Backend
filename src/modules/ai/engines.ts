@@ -41,13 +41,15 @@ export async function studentEngines(): Promise<EngineChoice[]> {
     else configs.push({ provider: p.id, model: p.defaultModel });
   }
   const seen = new Set<string>();
-  return configs.flatMap((c) => {
+  const list = configs.flatMap((c) => {
     const id = idOf(c);
     if (seen.has(id)) return [];
     seen.add(id);
     const info = providerInfo(c.provider);
-    return [{ id, provider: c.provider, model: c.model, label: `${info.label} · ${c.model}`, vision: info.vision, isDefault: id === idOf(def) }];
+    return [{ id, provider: c.provider, model: c.model, label: info.brand, vision: info.vision, isDefault: id === idOf(def) }];
   });
+  // Two engines under one name (e.g. several local models): add the model so students can tell them apart.
+  return list.map((e) => (list.filter((o) => o.label === e.label).length > 1 ? { ...e, label: `${e.label} · ${e.model}` } : e));
 }
 
 const built = new Map<string, { version: number; tutor: TutorLLM }>();

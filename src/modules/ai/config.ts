@@ -9,8 +9,17 @@ import { logger } from "../../lib/logger";
 export const PROVIDER_IDS = ["openai", "deepseek", "anthropic", "ollama", "mock"] as const;
 export type ProviderId = (typeof PROVIDER_IDS)[number];
 
+/** Progga's own names for the engines, shown to students and admins instead of vendor names. */
+export const ENGINE_BRANDS: Partial<Record<ProviderId, string>> = {
+  openai: "Progga Nova",
+  deepseek: "Progga Orbit V1",
+  ollama: "Progga Spark beta",
+};
+
 export interface ProviderInfo {
   id: ProviderId;
+  /** Progga's name for this engine (falls back to the vendor label) */
+  brand: string;
   label: string;
   configured: boolean;
   vision: boolean;
@@ -18,13 +27,14 @@ export interface ProviderInfo {
 }
 
 export function providers(): ProviderInfo[] {
-  return [
+  const list: Omit<ProviderInfo, "brand">[] = [
     { id: "openai", label: "OpenAI", configured: !!env.OPENAI_API_KEY, vision: true, defaultModel: env.OPENAI_MODEL },
     { id: "deepseek", label: "DeepSeek", configured: !!env.DEEPSEEK_API_KEY, vision: false, defaultModel: env.DEEPSEEK_MODEL },
     { id: "anthropic", label: "Anthropic Claude", configured: !!env.ANTHROPIC_API_KEY, vision: true, defaultModel: env.ANTHROPIC_MODEL },
     { id: "ollama", label: "Local (Ollama)", configured: !!env.OLLAMA_BASE_URL, vision: true, defaultModel: env.OLLAMA_MODEL },
     { id: "mock", label: "Offline practice (mock)", configured: true, vision: true, defaultModel: "offline" },
   ];
+  return list.map((p) => ({ ...p, brand: ENGINE_BRANDS[p.id] ?? p.label }));
 }
 
 export const providerInfo = (id: ProviderId) => providers().find((p) => p.id === id)!;
