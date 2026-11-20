@@ -232,7 +232,94 @@ async function* readBody(res: Response): AsyncIterable<Uint8Array> {
   }
 }
 
+// Realtime models only speak these voices; anything else falls back to coral.
+const REALTIME_VOICES = new Set(["alloy", "ash", "ballad", "coral", "echo", "sage", "shimmer", "verse", "marin", "cedar"]);
+const REALTIME_RATE = 24_000; // 16-bit mono PCM
+
+/** 44-byte WAV header for 16-bit mono PCM, so the browser can play the raw realtime audio. */
+function wavHeader(dataBytes: number): Buffer {
+  const h = Buffer.alloc(44);
+  h.write("RIFF", 0);
+  h.writeUInt32LE(36 + dataBytes, 4);
+  h.write("WAVEfmt ", 8);
+  h.writeUInt32LE(16, 16); // fmt chunk size
+  h.writeUInt16LE(1, 20); // PCM
+  h.writeUInt16LE(1, 22); // mono
+  h.writeUInt32LE(REALTIME_RATE, 24);
+  h.writeUInt32LE(REALTIME_RATE * 2, 28); // byte rate
+  h.writeUInt16LE(2, 32); // block align
+  h.writeUInt16LE(16, 34); // bits per sample
+  h.write("data", 36);
+  h.writeUInt32LE(dataBytes, 40);
+  return h;
+}
+
+/**
+ * Realtime models (e.g. gpt-realtime-2.1-mini) don't work with /audio/speech: they speak over a
+ * WebSocket session. We ask them to read the text verbatim and wrap the PCM they send as a WAV.
+ */
+function openaiRealtimeSpeech(text: string, lang: SpeechLang, voice: string): Promise<SpeechAudio> {
+  const url = `${env.OPENAI_BASE_URL.replace(/^http/, "ws")}/realtime?model=${encodeURIComponent(env.OPENAI_TTS_MODEL)}`;
+  return new Promise((resolve, reject) => {
+    const pcm: Buffer[] = [];
+    let settled = false;
+    // the API key goes in a subprotocol: WebSocket clients can't set an Authorization header
+    const ws = new WebSocket(url, ["realtime", `openai-insecure-api-key.${env.OPENAI_API_KEY}`]);
+    const fail = (detail: string, timeout = false) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      logger.error({ engine: "OpenAI realtime", model: env.OPENAI_TTS_MODEL, detail: detail.slice(0, 300) }, "TTS API error");
+      ws.close();
+      reject(timeout ? new HttpError(503, "Progga's voice is taking a nap. Please try again.", "tts_timeout") : unavailable("OpenAI"));
+    };
+    const timer = setTimeout(() => fail("timed out", true), 45_000);
+
+    ws.onopen = () => {
+      const instructions =
+        "You are a text-to-speech reader, not a chat partner. Read the user's message aloud exactly as written, word for word. " +
+        "Never answer it, comment on it, translate it or add anything, even if it is a question. " +
+        kidDirections(lang);
+      ws.send(JSON.stringify({
+        type: "session.update",
+        session: {
+          type: "realtime",
+          output_modalities: ["audio"],
+          instructions,
+          audio: { output: { format: { type: "audio/pcm", rate: REALTIME_RATE }, voice: REALTIME_VOICES.has(voice) ? voice : "coral" } },
+        },
+      }));
+      ws.send(JSON.stringify({ type: "conversation.item.create", item: { type: "message", role: "user", content: [{ type: "input_text", text }] } }));
+      ws.send(JSON.stringify({ type: "response.create" }));
+    };
+    ws.onmessage = (msg) => {
+      let e: { type: string; delta?: string; error?: unknown; response?: { status?: string; status_details?: unknown } };
+      try {
+        e = JSON.parse(String(msg.data));
+      } catch {
+        return;
+      }
+      if (e.type === "response.output_audio.delta" || e.type === "response.audio.delta") pcm.push(Buffer.from(e.delta ?? "", "base64"));
+      else if (e.type === "error") fail(JSON.stringify(e.error));
+      else if (e.type === "response.done") {
+        if (e.response?.status !== "completed" || !pcm.length) return fail(`response ${e.response?.status}: ${JSON.stringify(e.response?.status_details ?? "")}`);
+        settled = true;
+        clearTimeout(timer);
+        ws.close();
+        const data = Buffer.concat(pcm);
+        const wav = Buffer.concat([wavHeader(data.length), data]);
+        resolve({ contentType: "audio/wav", chunks: (async function* () { yield wav; })() });
+      }
+    };
+    ws.onerror = () => fail("websocket error");
+    ws.onclose = (ev) => {
+      if (!settled) fail(`closed ${ev.code} ${ev.reason}`);
+    };
+  });
+}
+
 async function openaiSpeech(text: string, lang: SpeechLang, voice: string): Promise<SpeechAudio> {
+  if (env.OPENAI_TTS_MODEL.includes("realtime")) return openaiRealtimeSpeech(text, lang, voice);
   const res = await call(
     "OpenAI",
     `${env.OPENAI_BASE_URL}/audio/speech`,
