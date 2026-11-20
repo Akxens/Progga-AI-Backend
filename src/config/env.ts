@@ -18,7 +18,7 @@ const EnvSchema = z.object({
     .enum(["true", "false"])
     .default("true")
     .transform((v) => v === "true"),
-  OPENAI_TTS_MODEL: z.string().default("gpt-4o-mini-tts"),
+  OPENAI_TTS_MODEL: z.string().default("gpt-realtime-2.1-mini"),
   // coral, directed as a 10-year-old, stays the most youthful in both English and Bangla
   OPENAI_TTS_VOICE: z.string().default("coral"),
   GEMINI_API_KEY: z.string().optional(),
