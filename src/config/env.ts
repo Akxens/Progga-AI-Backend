@@ -13,7 +13,8 @@ const EnvSchema = z.object({
   OPENAI_MODEL: z.string().default("gpt-6-luna"),
   OPENAI_BASE_URL: z.url().default("https://api.openai.com/v1"),
   // Read-aloud: Progga speaks its replies. Engines: OpenAI (OPENAI_API_KEY), Google Gemini TTS
-  // (GEMINI_API_KEY) or Azure Speech (AZURE_SPEECH_KEY + region); admins pick one in AI settings.
+  // (GEMINI_API_KEY), Azure Speech (AZURE_SPEECH_KEY + region) or ElevenLabs (ELEVENLABS_API_KEY);
+  // admins pick one per language in AI settings.
   VOICE_ENABLED: z
     .enum(["true", "false"])
     .default("true")
@@ -28,6 +29,9 @@ const EnvSchema = z.object({
   AZURE_SPEECH_REGION: z.string().optional(),
   /** Self-hosted IndicF5 voice server (indicf5/server.py), e.g. http://127.0.0.1:8020 */
   INDICF5_URL: z.url().optional(),
+  ELEVENLABS_API_KEY: z.string().optional(),
+  // eleven_v3 is the ElevenLabs model that speaks Bangla correctly (the v2 models garble it)
+  ELEVENLABS_MODEL: z.string().default("eleven_v3"),
   DEEPSEEK_API_KEY: z.string().optional(),
   DEEPSEEK_MODEL: z.string().default("deepseek-flash"),
   DEEPSEEK_BASE_URL: z.url().default("https://api.deepseek.com"),

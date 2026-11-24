@@ -7,8 +7,9 @@ import type { SpeechLang } from "./speech-text";
 
 // Text-to-speech engines for Progga's voice. Defaults come from .env; an admin can
 // switch engine and voice at runtime from AI settings, which is saved in the DB.
+// Bangla and English replies can each use their own engine and voice.
 
-export const TTS_PROVIDER_IDS = ["indicf5", "openai", "gemini", "azure"] as const;
+export const TTS_PROVIDER_IDS = ["elevenlabs", "indicf5", "openai", "gemini", "azure"] as const;
 export type TtsProviderId = (typeof TTS_PROVIDER_IDS)[number];
 
 export interface VoiceOption {
@@ -73,6 +74,19 @@ const AZURE_VOICES: Record<string, { label: string; note: string; bn: string; bn
   bashkar: { label: "Bashkar", note: "Male · India (bn-IN)", bn: "bn-IN-BashkarNeural", bnLang: "bn-IN", en: "en-IN-PrabhatNeural" },
 };
 
+// ElevenLabs default voices that work on every plan (library voices need a paid plan).
+// Any other voice id from the account (e.g. a custom or cloned voice) is accepted too.
+const ELEVENLABS_VOICES: VoiceOption[] = [
+  { id: "cgSgspJ2msm6clMCkdW9", label: "Jessica", note: "Playful, bright (default)" },
+  { id: "FGY2WhTYpPnrIDTdsKH5", label: "Laura", note: "Upbeat, quirky" },
+  { id: "pFZP5JQG7iQjIQuC4Bku", label: "Lily", note: "Warm, clear" },
+  { id: "EXAVITQu4vr4xnSDxMaL", label: "Sarah", note: "Soft, reassuring" },
+  { id: "XrExE9yKIg1WjnnlVkGX", label: "Matilda", note: "Friendly" },
+  { id: "Xb7hH8MSUJpSbSDYk0k2", label: "Alice", note: "Clear, engaging" },
+  { id: "IKne3meq5aSn9XLyUdCD", label: "Charlie", note: "Male, energetic" },
+  { id: "JBFqnCBsd6RMkjVDRZzb", label: "George", note: "Male, warm" },
+];
+
 // Voices on the self-hosted IndicF5 server: each is a reference clip it clones (indicf5/voices).
 let indicVoices: VoiceOption[] = [];
 
@@ -90,6 +104,17 @@ export async function refreshIndicVoices() {
 
 export function ttsProviders(): TtsProviderInfo[] {
   return [
+    {
+      id: "elevenlabs",
+      label: "ElevenLabs",
+      configured: !!env.ELEVENLABS_API_KEY,
+      keyHint: "ELEVENLABS_API_KEY",
+      model: env.ELEVENLABS_MODEL,
+      bangla: "Clear, natural Bangla (eleven_v3)",
+      voices: ELEVENLABS_VOICES,
+      defaultVoice: ELEVENLABS_VOICES[0].id,
+      lift: 1.06,
+    },
     {
       id: "indicf5",
       label: "IndicF5 (self-hosted)",
@@ -125,7 +150,7 @@ export function ttsProviders(): TtsProviderInfo[] {
     },
     {
       id: "openai",
-      label: "OpenAI",
+      label: "OpenAI GPT",
       configured: !!env.OPENAI_API_KEY,
       keyHint: "OPENAI_API_KEY",
       model: env.OPENAI_TTS_MODEL,
@@ -139,24 +164,41 @@ export function ttsProviders(): TtsProviderInfo[] {
 
 export const ttsProviderInfo = (id: TtsProviderId) => ttsProviders().find((p) => p.id === id)!;
 
-export const VoiceConfigSchema = z.object({
+/** One engine + voice. */
+export const VoiceChoiceSchema = z.object({
   provider: z.enum(TTS_PROVIDER_IDS),
   voice: z.string().trim().min(1).max(60),
 });
+export type VoiceChoice = z.infer<typeof VoiceChoiceSchema>;
+
+/** The Bangla (and default) voice, plus an optional different one for English replies. */
+export const VoiceConfigSchema = VoiceChoiceSchema.extend({ en: VoiceChoiceSchema.optional() });
 export type VoiceConfig = z.infer<typeof VoiceConfigSchema>;
 
-/** The voice must be one the engine offers (OpenAI accepts any id, for newer voices). */
-export function voiceExists(cfg: VoiceConfig): boolean {
+/** Which engine and voice speak a reply in this language. */
+export const choiceFor = (cfg: VoiceConfig, lang: SpeechLang): VoiceChoice =>
+  lang === "en" && cfg.en ? cfg.en : { provider: cfg.provider, voice: cfg.voice };
+
+/** The voice must be one the engine offers (OpenAI and ElevenLabs accept any id, for newer or custom voices). */
+export function voiceExists(cfg: VoiceChoice): boolean {
   // the IndicF5 server may still be starting; it reports unknown voices itself
-  if (cfg.provider === "openai" || (cfg.provider === "indicf5" && !indicVoices.length)) return true;
+  if (cfg.provider === "openai" || cfg.provider === "elevenlabs" || (cfg.provider === "indicf5" && !indicVoices.length)) return true;
   return ttsProviderInfo(cfg.provider).voices.some((v) => v.id === cfg.voice);
 }
+
+/** Both languages' engines have their keys and the voices exist. */
+export const usable = (cfg: VoiceConfig) =>
+  [cfg, ...(cfg.en ? [cfg.en] : [])].every((c) => ttsProviderInfo(c.provider).configured && voiceExists(c));
 
 const SETTING_KEY = "voice.config";
 
 function envDefault(): VoiceConfig {
-  // OpenAI first so existing setups keep their voice until an admin switches
-  const p = ttsProviders().find((x) => x.id === "openai" && x.configured) ?? ttsProviders().find((x) => x.configured) ?? ttsProviderInfo("openai");
+  // ElevenLabs when it has a key (the default voice), then OpenAI, then whatever is set up
+  const p =
+    ttsProviders().find((x) => x.id === "elevenlabs" && x.configured) ??
+    ttsProviders().find((x) => x.id === "openai" && x.configured) ??
+    ttsProviders().find((x) => x.configured) ??
+    ttsProviderInfo("openai");
   return { provider: p.id, voice: p.defaultVoice };
 }
 
@@ -170,7 +212,7 @@ export async function loadVoiceConfig() {
   const row = await prisma.appSetting.findUnique({ where: { key: SETTING_KEY } });
   if (!row) return;
   const parsed = VoiceConfigSchema.safeParse(JSON.parse(row.value));
-  if (parsed.success && ttsProviderInfo(parsed.data.provider).configured && voiceExists(parsed.data)) current = parsed.data;
+  if (parsed.success && usable(parsed.data)) current = parsed.data;
   else logger.warn("Saved voice settings are invalid or missing an API key; using .env defaults");
 }
 
@@ -432,6 +474,27 @@ async function azureSpeech(text: string, lang: SpeechLang, voice: string): Promi
   return { contentType: "audio/mpeg", chunks: readBody(res) };
 }
 
+async function elevenlabsSpeech(text: string, lang: SpeechLang, voice: string): Promise<SpeechAudio> {
+  // the stream endpoint sends MP3 as it is generated, so the first words play within about a second
+  const res = await call(
+    "ElevenLabs",
+    `https://api.elevenlabs.io/v1/text-to-speech/${encodeURIComponent(voice)}/stream?output_format=mp3_44100_128`,
+    {
+      method: "POST",
+      headers: { "xi-api-key": env.ELEVENLABS_API_KEY!, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        text,
+        model_id: env.ELEVENLABS_MODEL,
+        language_code: lang,
+        // v3 takes 0, 0.5 or 1: 0.5 keeps the voice steady but still lively
+        voice_settings: { stability: 0.5, similarity_boost: 0.75 },
+      }),
+    },
+    60_000,
+  );
+  return { contentType: "audio/mpeg", chunks: readBody(res) };
+}
+
 async function indicf5Speech(text: string, voice: string): Promise<SpeechAudio> {
   // generous timeout: the GPU is shared with the tutor's model
   const res = await call(
@@ -443,8 +506,10 @@ async function indicf5Speech(text: string, voice: string): Promise<SpeechAudio> 
   return { contentType: "audio/wav", chunks: readBody(res) };
 }
 
-/** Speaks `text` (already turned into plain words) with the given engine and voice. */
-export function synthesize(cfg: VoiceConfig, text: string, lang: SpeechLang): Promise<SpeechAudio> {
+/** Speaks `text` (already turned into plain words) with the engine and voice set for its language. */
+export function synthesize(config: VoiceConfig, text: string, lang: SpeechLang): Promise<SpeechAudio> {
+  const cfg = choiceFor(config, lang);
+  if (cfg.provider === "elevenlabs") return elevenlabsSpeech(text, lang, cfg.voice);
   if (cfg.provider === "indicf5") {
     // IndicF5 only knows Indian languages, so English replies go to OpenAI when it has a key
     return lang === "en" && env.OPENAI_API_KEY ? openaiSpeech(text, lang, env.OPENAI_TTS_VOICE) : indicf5Speech(text, cfg.voice);

@@ -3,7 +3,7 @@ import { env } from "../../config/env";
 import { HttpError, notFound } from "../../lib/errors";
 import { logger } from "../../lib/logger";
 import { prisma } from "../../lib/prisma";
-import { getVoiceConfig, synthesize, ttsProviderInfo, type SpeechAudio, type VoiceConfig } from "./engines";
+import { choiceFor, getVoiceConfig, synthesize, ttsProviderInfo, type SpeechAudio, type VoiceConfig } from "./engines";
 import { detectLang, toSpokenText, type SpeechLang } from "./speech-text";
 
 export const voiceAvailable = () => env.VOICE_ENABLED && ttsProviderInfo(getVoiceConfig().provider).configured;
@@ -181,7 +181,9 @@ export async function sendSpeech(studentId: string, sessionId: string, messageId
     throw notFound("Message not found");
   }
 
-  const cfg = getVoiceConfig();
+  const config = getVoiceConfig();
+  // Bangla and English replies may use different engines: pick the one for this message
+  const cfg = choiceFor(config, detectLang(message.content));
   const { model } = ttsProviderInfo(cfg.provider);
   // The saved clip must match the engine, voice, style AND text. OpenAI keeps its older
   // key (no engine prefix) so clips recorded before engines were selectable still count.
@@ -198,7 +200,7 @@ export async function sendSpeech(studentId: string, sessionId: string, messageId
 
   const text = speechFor(message, optionsFor(message, message.session.plan));
   if (!text) throw notFound("Nothing to read");
-  const audio = await pipeAudio(await synthesize(cfg, text, detectLang(text)), res);
+  const audio = await pipeAudio(await synthesize({ ...cfg, en: cfg }, text, detectLang(text)), res);
   await prisma.speechClip
     .upsert({ where: { messageId }, create: { messageId, voice, model, audio }, update: { voice, model, audio } })
     .catch((err) => logger.warn({ err: (err as Error).message, messageId }, "Could not cache speech"));
