@@ -1,6 +1,7 @@
 import type { User } from "@prisma/client";
 import { z } from "zod";
 import { MobileField } from "../../lib/contact";
+import { dayKey } from "../../lib/dates";
 
 // The "About me" side of an account: stored as one JSON column so new fields
 // don't need a migration. Every field is optional; "" clears it.
@@ -12,7 +13,7 @@ const orClear = <T extends z.ZodType>(field: T) => z.union([z.literal(""), field
 
 export const Birthdate = z.iso
   .date()
-  .refine((d) => d >= "1920-01-01" && d <= new Date().toISOString().slice(0, 10), { message: "Check the birthdate" });
+  .refine((d) => d >= "1920-01-01" && d <= dayKey(), { message: "Check the birthdate" });
 
 export const ProfilePatch = z
   .object({

@@ -1,6 +1,6 @@
 import { logger } from "../../lib/logger";
 import { buildTutor, listModels, tutorLLM, type TutorLLM } from "../tutor/llm";
-import { aiConfigVersion, getAiConfig, providerInfo, providers, type AiConfig } from "./config";
+import { aiConfigVersion, ensureAiConfig, getAiConfig, providerInfo, providers, type AiConfig } from "./config";
 
 // Engines a student may pick in the chat: the admin's choice (the default),
 // every cloud provider that has a key, and every model installed in Ollama.
@@ -33,7 +33,7 @@ async function ollamaModels(): Promise<string[]> {
 }
 
 export async function studentEngines(): Promise<EngineChoice[]> {
-  const def = getAiConfig();
+  const def = await ensureAiConfig();
   const configs: AiConfig[] = [def];
   for (const p of providers()) {
     if (!p.configured || p.id === "mock") continue;
@@ -56,6 +56,7 @@ const built = new Map<string, { version: number; tutor: TutorLLM }>();
 
 /** The engine for one request: the student's pick when it's on the list, otherwise the admin's choice. */
 export async function tutorFor(engine?: string): Promise<TutorLLM> {
+  await ensureAiConfig();
   if (!engine) return tutorLLM;
   const choice = (await studentEngines()).find((e) => e.id === engine);
   if (!choice || choice.isDefault) return tutorLLM;

@@ -191,6 +191,7 @@ export const usable = (cfg: VoiceConfig) =>
   [cfg, ...(cfg.en ? [cfg.en] : [])].every((c) => ttsProviderInfo(c.provider).configured && voiceExists(c));
 
 const SETTING_KEY = "voice.config";
+const TTL_MS = 15_000;
 
 function envDefault(): VoiceConfig {
   // ElevenLabs when it has a key (the default voice), then OpenAI, then whatever is set up
@@ -203,17 +204,49 @@ function envDefault(): VoiceConfig {
 }
 
 let current: VoiceConfig = envDefault();
+let loadedAt = 0;
+let inflight: Promise<VoiceConfig> | null = null;
 
 export const getVoiceConfig = () => current;
+
+async function fetchVoiceConfig(): Promise<VoiceConfig> {
+  try {
+    const row = await prisma.appSetting.findUnique({ where: { key: SETTING_KEY } });
+    if (row) {
+      let raw: unknown;
+      try {
+        raw = JSON.parse(row.value);
+      } catch {
+        logger.warn("Saved voice settings contain invalid JSON; using fallback defaults");
+        loadedAt = Date.now();
+        return current;
+      }
+      const parsed = VoiceConfigSchema.safeParse(raw);
+      if (parsed.success && usable(parsed.data)) current = parsed.data;
+      else logger.warn("Saved voice settings are invalid or missing an API key; using .env defaults");
+    }
+    loadedAt = Date.now();
+  } catch (err) {
+    logger.error({ err: (err as Error).message }, "Couldn't load voice settings");
+  }
+  return current;
+}
+
+/** Returns the active voice config, refreshing from DB at most once every 15s (or when forced). */
+export async function ensureVoiceConfig(force = false): Promise<VoiceConfig> {
+  if (!force && loadedAt > 0 && Date.now() - loadedAt < TTL_MS) return current;
+  if (!inflight) {
+    inflight = fetchVoiceConfig().finally(() => {
+      inflight = null;
+    });
+  }
+  return inflight;
+}
 
 /** Loads the admin-chosen voice from the DB (falls back to .env if unset or no longer usable). */
 export async function loadVoiceConfig() {
   await refreshIndicVoices();
-  const row = await prisma.appSetting.findUnique({ where: { key: SETTING_KEY } });
-  if (!row) return;
-  const parsed = VoiceConfigSchema.safeParse(JSON.parse(row.value));
-  if (parsed.success && usable(parsed.data)) current = parsed.data;
-  else logger.warn("Saved voice settings are invalid or missing an API key; using .env defaults");
+  await ensureVoiceConfig(true);
 }
 
 export async function saveVoiceConfig(cfg: VoiceConfig) {
@@ -223,6 +256,7 @@ export async function saveVoiceConfig(cfg: VoiceConfig) {
     update: { value: JSON.stringify(cfg) },
   });
   current = cfg;
+  loadedAt = Date.now();
 }
 
 // ── Speaking ─────────────────────────────────────────────
@@ -252,11 +286,13 @@ function kidDirections(lang: SpeechLang): string {
 
 const unavailable = (label: string) => new HttpError(503, `Progga's voice (${label}) isn't available right now.`, "tts_error");
 
-async function call(label: string, url: string, init: RequestInit, timeoutMs: number): Promise<Response> {
+async function call(label: string, url: string, init: RequestInit, timeoutMs: number, signal?: AbortSignal): Promise<Response> {
+  const combined = signal ? AbortSignal.any([AbortSignal.timeout(timeoutMs), signal]) : AbortSignal.timeout(timeoutMs);
   let res: Response;
   try {
-    res = await fetch(url, { ...init, signal: AbortSignal.timeout(timeoutMs) });
+    res = await fetch(url, { ...init, signal: combined });
   } catch (err) {
+    if (signal?.aborted) throw err;
     logger.error({ err: (err as Error).message, engine: label }, "TTS request failed");
     throw new HttpError(503, "Progga's voice is taking a nap. Please try again.", "tts_timeout");
   }
@@ -267,12 +303,20 @@ async function call(label: string, url: string, init: RequestInit, timeoutMs: nu
   return res;
 }
 
-async function* readBody(res: Response): AsyncIterable<Uint8Array> {
+async function* readBody(res: Response, signal?: AbortSignal): AsyncIterable<Uint8Array> {
   const reader = res.body!.getReader();
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) return;
-    yield value;
+  try {
+    for (;;) {
+      if (signal?.aborted) {
+        await reader.cancel().catch(() => undefined);
+        return;
+      }
+      const { done, value } = await reader.read();
+      if (done) return;
+      yield value;
+    }
+  } finally {
+    if (signal?.aborted) await reader.cancel().catch(() => undefined);
   }
 }
 
@@ -315,7 +359,8 @@ function fixWavSizes(whole: Buffer): Buffer {
  * WebSocket session. We ask them to read the text verbatim and stream the PCM they send as a WAV,
  * so Progga starts talking as soon as the first words arrive instead of after the whole clip.
  */
-function openaiRealtimeSpeech(text: string, lang: SpeechLang, voice: string): Promise<SpeechAudio> {
+function openaiRealtimeSpeech(text: string, lang: SpeechLang, voice: string, signal?: AbortSignal): Promise<SpeechAudio> {
+  if (signal?.aborted) return Promise.reject(new DOMException("Aborted", "AbortError"));
   const url = `${env.OPENAI_BASE_URL.replace(/^http/, "ws")}/realtime?model=${encodeURIComponent(env.OPENAI_TTS_MODEL)}`;
   return new Promise((resolve, reject) => {
     // audio pieces waiting to be read, and the reader waiting for the next piece
@@ -331,12 +376,20 @@ function openaiRealtimeSpeech(text: string, lang: SpeechLang, voice: string): Pr
 
     // the API key goes in a subprotocol: WebSocket clients can't set an Authorization header
     const ws = new WebSocket(url, ["realtime", `openai-insecure-api-key.${env.OPENAI_API_KEY}`]);
+    const onAbort = () => {
+      if (ended) return;
+      failure = new DOMException("Aborted", "AbortError");
+      finish();
+      if (!started) reject(failure);
+    };
     const finish = () => {
       clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
       ended = true;
       ws.close();
       notify();
     };
+    signal?.addEventListener("abort", onAbort, { once: true });
     const fail = (detail: string, timeout = false) => {
       if (ended) return;
       logger.error({ engine: "OpenAI realtime", model: env.OPENAI_TTS_MODEL, detail: detail.slice(0, 300) }, "TTS API error");
@@ -404,8 +457,8 @@ function openaiRealtimeSpeech(text: string, lang: SpeechLang, voice: string): Pr
   });
 }
 
-async function openaiSpeech(text: string, lang: SpeechLang, voice: string): Promise<SpeechAudio> {
-  if (env.OPENAI_TTS_MODEL.includes("realtime")) return openaiRealtimeSpeech(text, lang, voice);
+async function openaiSpeech(text: string, lang: SpeechLang, voice: string, signal?: AbortSignal): Promise<SpeechAudio> {
+  if (env.OPENAI_TTS_MODEL.includes("realtime")) return openaiRealtimeSpeech(text, lang, voice, signal);
   const res = await call(
     "OpenAI",
     `${env.OPENAI_BASE_URL}/audio/speech`,
@@ -415,11 +468,12 @@ async function openaiSpeech(text: string, lang: SpeechLang, voice: string): Prom
       body: JSON.stringify({ model: env.OPENAI_TTS_MODEL, voice, input: text, instructions: kidDirections(lang), response_format: "mp3" }),
     },
     30_000,
+    signal,
   );
-  return { contentType: "audio/mpeg", chunks: readBody(res) };
+  return { contentType: "audio/mpeg", chunks: readBody(res, signal) };
 }
 
-async function geminiSpeech(text: string, lang: SpeechLang, voice: string): Promise<SpeechAudio> {
+async function geminiSpeech(text: string, lang: SpeechLang, voice: string, signal?: AbortSignal): Promise<SpeechAudio> {
   // Gemini reads `text` word for word; how to say it goes in speech_metadata.style.
   const res = await call(
     "Gemini",
@@ -433,6 +487,7 @@ async function geminiSpeech(text: string, lang: SpeechLang, voice: string): Prom
       }),
     },
     60_000,
+    signal,
   );
   const json = (await res.json().catch(() => null)) as {
     candidates?: { content?: { parts?: { inlineData?: { data?: string; mimeType?: string } }[] } }[];
@@ -449,7 +504,7 @@ async function geminiSpeech(text: string, lang: SpeechLang, voice: string): Prom
 
 const xmlEscape = (s: string) => s.replace(/[<>&'"]/g, (c) => ({ "<": "&lt;", ">": "&gt;", "&": "&amp;", "'": "&apos;", '"': "&quot;" })[c]!);
 
-async function azureSpeech(text: string, lang: SpeechLang, voice: string): Promise<SpeechAudio> {
+async function azureSpeech(text: string, lang: SpeechLang, voice: string, signal?: AbortSignal): Promise<SpeechAudio> {
   const v = AZURE_VOICES[voice] ?? AZURE_VOICES.nabanita;
   const [name, xmlLang] = lang === "bn" ? [v.bn, v.bnLang] : [v.en, v.en.slice(0, 5)];
   // a touch higher and slower than normal: friendlier for kids (the app's playback lift adds the rest)
@@ -470,11 +525,12 @@ async function azureSpeech(text: string, lang: SpeechLang, voice: string): Promi
       body: ssml,
     },
     30_000,
+    signal,
   );
-  return { contentType: "audio/mpeg", chunks: readBody(res) };
+  return { contentType: "audio/mpeg", chunks: readBody(res, signal) };
 }
 
-async function elevenlabsSpeech(text: string, lang: SpeechLang, voice: string): Promise<SpeechAudio> {
+async function elevenlabsSpeech(text: string, lang: SpeechLang, voice: string, signal?: AbortSignal): Promise<SpeechAudio> {
   // the stream endpoint sends MP3 as it is generated, so the first words play within about a second
   const res = await call(
     "ElevenLabs",
@@ -491,30 +547,32 @@ async function elevenlabsSpeech(text: string, lang: SpeechLang, voice: string): 
       }),
     },
     60_000,
+    signal,
   );
-  return { contentType: "audio/mpeg", chunks: readBody(res) };
+  return { contentType: "audio/mpeg", chunks: readBody(res, signal) };
 }
 
-async function indicf5Speech(text: string, voice: string): Promise<SpeechAudio> {
+async function indicf5Speech(text: string, voice: string, signal?: AbortSignal): Promise<SpeechAudio> {
   // generous timeout: the GPU is shared with the tutor's model
   const res = await call(
     "IndicF5",
     `${env.INDICF5_URL}/tts`,
     { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ text, voice }) },
     120_000,
+    signal,
   );
-  return { contentType: "audio/wav", chunks: readBody(res) };
+  return { contentType: "audio/wav", chunks: readBody(res, signal) };
 }
 
 /** Speaks `text` (already turned into plain words) with the engine and voice set for its language. */
-export function synthesize(config: VoiceConfig, text: string, lang: SpeechLang): Promise<SpeechAudio> {
+export function synthesize(config: VoiceConfig, text: string, lang: SpeechLang, signal?: AbortSignal): Promise<SpeechAudio> {
   const cfg = choiceFor(config, lang);
-  if (cfg.provider === "elevenlabs") return elevenlabsSpeech(text, lang, cfg.voice);
+  if (cfg.provider === "elevenlabs") return elevenlabsSpeech(text, lang, cfg.voice, signal);
   if (cfg.provider === "indicf5") {
     // IndicF5 only knows Indian languages, so English replies go to OpenAI when it has a key
-    return lang === "en" && env.OPENAI_API_KEY ? openaiSpeech(text, lang, env.OPENAI_TTS_VOICE) : indicf5Speech(text, cfg.voice);
+    return lang === "en" && env.OPENAI_API_KEY ? openaiSpeech(text, lang, env.OPENAI_TTS_VOICE, signal) : indicf5Speech(text, cfg.voice, signal);
   }
-  if (cfg.provider === "gemini") return geminiSpeech(text, lang, cfg.voice);
-  if (cfg.provider === "azure") return azureSpeech(text, lang, cfg.voice);
-  return openaiSpeech(text, lang, cfg.voice);
+  if (cfg.provider === "gemini") return geminiSpeech(text, lang, cfg.voice, signal);
+  if (cfg.provider === "azure") return azureSpeech(text, lang, cfg.voice, signal);
+  return openaiSpeech(text, lang, cfg.voice, signal);
 }

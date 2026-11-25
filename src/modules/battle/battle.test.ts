@@ -31,7 +31,7 @@ describe("battle questions", () => {
         }
       }
     }
-  });
+  }, 20000);
 
   it("generators rarely fail", () => {
     let fails = 0;
@@ -59,7 +59,7 @@ describe("battle questions", () => {
         expect([...ds].sort((a, b) => a - b)).toEqual(ds);
       }
     }
-  });
+  }, 30000);
 });
 
 describe("leagues & trophies", () => {

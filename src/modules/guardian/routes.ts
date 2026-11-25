@@ -2,26 +2,27 @@ import { Router } from "express";
 import { z } from "zod";
 import { prisma } from "../../lib/prisma";
 import { addDays, dayKey, dayStartUtc } from "../../lib/dates";
-import { conflict, forbidden, notFound } from "../../lib/errors";
-import { AUTH_COOKIE, GUARDIAN_COOKIE, authed, requireAuth, requireRole, setSessionCookie, signToken } from "../../middleware/auth";
+import { conflict, forbidden, notFound, parseId } from "../../lib/errors";
+import { AUTH_COOKIE, GUARDIAN_COOKIE, authed, requireAuth, requireFreshSession, requireRole, setSessionCookie, signToken } from "../../middleware/auth";
 import { levelProgress } from "../gamification/levels";
 import { photoUrl, publicUser } from "../users/presenter";
 import { profileStatus, readProfile } from "../users/profile";
 import type { Plan, StepProgress } from "../tutor/schemas";
 
 // Parents and teachers see progress, learning habits and safety alerts for
-// the students who shared their link code with them.
+// the students who shared their link code with them (admins using this portal
+// must also explicitly link a student via linkCode).
 export const guardianRouter = Router();
-guardianRouter.use(requireAuth, requireRole("PARENT", "TEACHER", "ADMIN"));
+guardianRouter.use(requireAuth, requireFreshSession, requireRole("PARENT", "TEACHER", "ADMIN"));
 
 async function assertLinked(guardianId: string, studentId: string) {
   const link = await prisma.guardianLink.findUnique({ where: { guardianId_studentId: { guardianId, studentId } } });
-  if (!link) throw forbidden("This student isn't linked to your account");
+  if (!link || link.status !== "active") throw forbidden("This student isn't linked to your account");
 }
 
 guardianRouter.get("/students", async (req, res) => {
   const links = await prisma.guardianLink.findMany({
-    where: { guardianId: authed(req).id },
+    where: { guardianId: authed(req).id, status: "active" },
     include: { student: true },
     orderBy: { createdAt: "asc" },
   });
@@ -60,41 +61,94 @@ guardianRouter.post("/link", async (req, res) => {
   if (!student || student.role !== "STUDENT") throw notFound("No student found with that code");
   const guardianId = authed(req).id;
   const exists = await prisma.guardianLink.findUnique({ where: { guardianId_studentId: { guardianId, studentId: student.id } } });
-  if (exists) throw conflict(`${student.name} is already linked`);
-  await prisma.guardianLink.create({ data: { guardianId, studentId: student.id } });
+  if (exists) {
+    if (exists.status === "active") {
+      throw conflict(`${student.name} is already linked`);
+    }
+    await prisma.guardianLink.update({
+      where: { id: exists.id },
+      data: {
+        status: "active",
+        relation: exists.relation || "guardian",
+        isVerified: false,
+        verificationMethod: "link_code",
+        revokedAt: null,
+        revokedById: null,
+        revokedReason: null,
+      },
+    });
+  } else {
+    await prisma.guardianLink.create({
+      data: {
+        guardianId,
+        studentId: student.id,
+        status: "active",
+        relation: "guardian",
+        isVerified: false,
+        verificationMethod: "link_code",
+      },
+    });
+  }
+
+  await prisma.studentProfile.updateMany({
+    where: { userId: student.id, guardianStatus: "none" },
+    data: { guardianStatus: "linked_unverified" },
+  });
+
   res.status(201).json({ student: { id: student.id, name: student.name, grade: student.grade } });
 });
 
 /** "Learn as Rafi": opens a linked kid's profile on this device and parks the parent's session for switching back. */
 guardianRouter.post("/students/:id/switch", async (req, res) => {
   const me = authed(req);
-  const studentId = req.params.id as string;
+  const studentId = parseId(req.params.id);
   await assertLinked(me.id, studentId);
   const student = await prisma.user.findUniqueOrThrow({ where: { id: studentId } });
   setSessionCookie(res, GUARDIAN_COOKIE, signToken(me));
-  setSessionCookie(res, AUTH_COOKIE, signToken({ id: student.id, role: "STUDENT" }));
+  setSessionCookie(res, AUTH_COOKIE, signToken({ id: student.id, role: "STUDENT", delegatedBy: me.id }));
   res.json({ user: publicUser(student) });
 });
 
 guardianRouter.delete("/students/:id", async (req, res) => {
   const guardianId = authed(req).id;
-  await assertLinked(guardianId, req.params.id as string);
-  await prisma.guardianLink.delete({ where: { guardianId_studentId: { guardianId, studentId: req.params.id as string } } });
+  const studentId = parseId(req.params.id);
+  await assertLinked(guardianId, studentId);
+  await prisma.guardianLink.update({
+    where: { guardianId_studentId: { guardianId, studentId } },
+    data: {
+      status: "revoked",
+      revokedAt: new Date(),
+      revokedById: guardianId,
+      revokedReason: "guardian_removed",
+    },
+  });
+
+  const remaining = await prisma.guardianLink.count({
+    where: { studentId, status: "active" },
+  });
+  if (remaining === 0) {
+    await prisma.studentProfile.updateMany({
+      where: { userId: studentId },
+      data: { guardianStatus: "none" },
+    });
+  }
+
   res.json({ ok: true });
 });
 
 const SettingsBody = z.object({ dailyTutorLimit: z.coerce.number().int().min(1).max(100) });
 
 guardianRouter.patch("/students/:id/settings", async (req, res) => {
-  await assertLinked(authed(req).id, req.params.id as string);
+  const studentId = parseId(req.params.id);
+  await assertLinked(authed(req).id, studentId);
   const body = SettingsBody.parse(req.body);
-  const s = await prisma.user.update({ where: { id: req.params.id as string }, data: body });
+  const s = await prisma.user.update({ where: { id: studentId }, data: body });
   res.json({ dailyTutorLimit: s.dailyTutorLimit });
 });
 
 /** Learning report: habits, independence, topics, misconceptions, safety. */
 guardianRouter.get("/students/:id/report", async (req, res) => {
-  const studentId = req.params.id as string;
+  const studentId = parseId(req.params.id);
   await assertLinked(authed(req).id, studentId);
   const student = await prisma.user.findUniqueOrThrow({ where: { id: studentId } });
 
@@ -184,12 +238,14 @@ guardianRouter.get("/students/:id/report", async (req, res) => {
 
 /** Read-only transcript so parents/teachers can see *how* their child is thinking. */
 guardianRouter.get("/students/:id/sessions/:sessionId", async (req, res) => {
-  await assertLinked(authed(req).id, req.params.id as string);
+  const studentId = parseId(req.params.id);
+  const sessionId = parseId(req.params.sessionId);
+  await assertLinked(authed(req).id, studentId);
   const s = await prisma.tutorSession.findUnique({
-    where: { id: req.params.sessionId as string },
+    where: { id: sessionId },
     include: { messages: { orderBy: { createdAt: "asc" } } },
   });
-  if (!s || s.studentId !== req.params.id) throw notFound("Session not found");
+  if (!s || s.studentId !== studentId) throw notFound("Session not found");
   res.json({
     session: {
       id: s.id,

@@ -1,4 +1,5 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
+import crypto from "node:crypto";
 import express from "express";
 import cors from "cors";
 import helmet from "helmet";
@@ -6,6 +7,7 @@ import cookieParser from "cookie-parser";
 import rateLimit from "express-rate-limit";
 import { env } from "./config/env";
 import { errorHandler, notFoundHandler } from "./middleware/error";
+import { requireOrigin } from "./middleware/auth";
 import { authRouter } from "./modules/auth/routes";
 import { photosRouter, usersRouter } from "./modules/users/routes";
 import { subjectsRouter } from "./modules/subjects/routes";
@@ -17,23 +19,37 @@ import { gamificationRouter } from "./modules/gamification/routes";
 import { guardianRouter } from "./modules/guardian/routes";
 import { battleRouter } from "./modules/battle/routes";
 import { labRouter } from "./modules/lab/routes";
+import { eventsRouter } from "./modules/events/routes";
+import { billingRouter } from "./modules/billing/routes";
 import { requireFeature } from "./modules/features/config";
 import { featuresAdminRouter, featuresRouter } from "./modules/features/routes";
 import { tutorLLM } from "./modules/tutor/llm";
+import { adminRouter } from "./admin";
+import { internalJobsRouter } from "./jobs/routes";
 import { aiAdminRouter } from "./modules/ai/routes";
-import { loadAiConfig } from "./modules/ai/config";
-import { voiceAvailable, voiceLift } from "./modules/voice/service";
-import { loadVoiceConfig } from "./modules/voice/engines";
+import { ensureAiConfig, loadAiConfig } from "./modules/ai/config";
+import { ensureVoiceConfig, loadVoiceConfig } from "./modules/voice/engines";
+import { voiceAvailable, voiceKey, voiceLift, voiceLifts } from "./modules/voice/service";
 import { voiceAdminRouter } from "./modules/voice/routes";
-import { logger } from "./lib/logger";
+import { logger, runWithReqId } from "./lib/logger";
+import { prisma } from "./lib/prisma";
+import { correlationMiddleware } from "./middleware/correlation";
 
 export function createApp() {
   const app = express();
   app.set("trust proxy", 1);
+  app.use(correlationMiddleware);
+  app.use((req, res, next) => {
+    const raw = req.get("x-request-id");
+    const reqId = raw && /^[A-Za-z0-9._-]{1,64}$/.test(raw) ? raw : req.correlationId || crypto.randomUUID();
+    res.setHeader("X-Request-Id", reqId);
+    runWithReqId(reqId, next);
+  });
   app.use(helmet());
   app.use(cors({ origin: env.corsOrigins, credentials: true }));
   app.use(express.json({ limit: "100kb" }));
   app.use(cookieParser());
+  app.use(requireOrigin(env.corsOrigins));
   app.use(
     "/api",
     rateLimit({
@@ -46,13 +62,28 @@ export function createApp() {
     }),
   );
 
-  app.get("/api/health", (_req, res) => {
-    res.json({
-      ok: true,
+  app.get("/api/health", async (req, res) => {
+    await Promise.all([ensureAiConfig(), ensureVoiceConfig()]);
+    const deep = req.query.deep === "1" || req.query.deep === "true";
+    let db: "ok" | "error" | undefined;
+    if (deep) {
+      try {
+        await prisma.$queryRaw`SELECT 1`;
+        db = "ok";
+      } catch (err) {
+        logger.error({ err: (err as Error).message }, "Deep health DB probe failed");
+        db = "error";
+      }
+    }
+    res.status(db === "error" ? 503 : 200).json({
+      ok: db !== "error",
       service: "progga-api",
+      ...(db && { db }),
       llm: { provider: tutorLLM.name, model: tutorLLM.model, vision: tutorLLM.supportsImages },
       voice: voiceAvailable(),
       voiceLift: voiceLift(),
+      voiceLifts: voiceLifts(),
+      voiceKey: voiceKey(),
       time: new Date().toISOString(),
     });
   });
@@ -70,9 +101,14 @@ export function createApp() {
   app.use("/api/features", featuresRouter);
   app.use("/api/battle", requireFeature("battle"), battleRouter);
   app.use("/api/lab", requireFeature("lab"), labRouter);
+  app.use("/api/events", eventsRouter);
+  app.use("/api/billing", billingRouter);
+  app.use("/api/webhooks", billingRouter);
+  app.use("/api/admin", adminRouter);
   app.use("/api/admin/ai", aiAdminRouter);
   app.use("/api/admin/voice", voiceAdminRouter);
   app.use("/api/admin/features", featuresAdminRouter);
+  app.use("/api/internal/jobs", internalJobsRouter);
 
   app.use(notFoundHandler);
   app.use(errorHandler);

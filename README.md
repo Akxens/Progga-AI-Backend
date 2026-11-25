@@ -48,4 +48,12 @@ Expected answers, unseen hints and the final answer never leave the server, and 
 
 - On Vercel, set `DATABASE_URL` (pooled) and `DIRECT_URL` (direct) to your Postgres/Neon connection strings.
 - Use a long random `JWT_SECRET` and set `CORS_ORIGINS` to your frontend URL.
+
+## Migrations
+
+The database uses reviewable, ordered Prisma migrations.
+- Apply pending migrations in production or CI: `npm run db:migrate` (`npx prisma migrate deploy`).
+- For initial setup: `npm run setup` (`npx prisma migrate deploy && tsx prisma/seed.ts`).
+- `npm run db:push` is retained for local prototyping only; never use in staging or production.
+
 - Replace the placeholder lesson videos in `prisma/seed.ts` with real content.

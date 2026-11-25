@@ -47,6 +47,8 @@ export const AiConfigSchema = z.object({
 export type AiConfig = z.infer<typeof AiConfigSchema>;
 
 const SETTING_KEY = "ai.config";
+/** Serverless instances each keep a copy, so re-read periodically to pick up admin changes. */
+const TTL_MS = 15_000;
 
 function envDefault(): AiConfig {
   const p = providerInfo(env.llmProvider);
@@ -55,22 +57,56 @@ function envDefault(): AiConfig {
 
 let current: AiConfig = envDefault();
 let version = 0;
+let loadedAt = 0;
+let inflight: Promise<AiConfig> | null = null;
 
 export const getAiConfig = () => current;
 /** Bumps whenever the config changes, so engines can be rebuilt lazily. */
 export const aiConfigVersion = () => version;
 
+async function fetchAiConfig(): Promise<AiConfig> {
+  try {
+    const row = await prisma.appSetting.findUnique({ where: { key: SETTING_KEY } });
+    if (row) {
+      let raw: unknown;
+      try {
+        raw = JSON.parse(row.value);
+      } catch {
+        logger.warn("Saved AI settings contain invalid JSON; using fallback defaults");
+        loadedAt = Date.now();
+        return current;
+      }
+      const parsed = AiConfigSchema.safeParse(raw);
+      if (parsed.success && providerInfo(parsed.data.provider).configured) {
+        if (parsed.data.provider !== current.provider || parsed.data.model !== current.model) {
+          current = parsed.data;
+          version++;
+        }
+      } else {
+        logger.warn("Saved AI settings are invalid or missing an API key; using .env defaults");
+      }
+    }
+    loadedAt = Date.now();
+  } catch (err) {
+    logger.error({ err: (err as Error).message }, "Couldn't load AI settings");
+  }
+  return current;
+}
+
+/** Returns the active AI config, refreshing from DB at most once every 15s (or when forced). */
+export async function ensureAiConfig(force = false): Promise<AiConfig> {
+  if (!force && loadedAt > 0 && Date.now() - loadedAt < TTL_MS) return current;
+  if (!inflight) {
+    inflight = fetchAiConfig().finally(() => {
+      inflight = null;
+    });
+  }
+  return inflight;
+}
+
 /** Loads the admin-chosen engine from the DB (falls back to .env if unset or no longer usable). */
 export async function loadAiConfig() {
-  const row = await prisma.appSetting.findUnique({ where: { key: SETTING_KEY } });
-  if (!row) return;
-  const parsed = AiConfigSchema.safeParse(JSON.parse(row.value));
-  if (parsed.success && providerInfo(parsed.data.provider).configured) {
-    current = parsed.data;
-    version++;
-  } else {
-    logger.warn("Saved AI settings are invalid or missing an API key; using .env defaults");
-  }
+  await ensureAiConfig(true);
 }
 
 export async function saveAiConfig(cfg: AiConfig) {
@@ -79,6 +115,7 @@ export async function saveAiConfig(cfg: AiConfig) {
     create: { key: SETTING_KEY, value: JSON.stringify(cfg) },
     update: { value: JSON.stringify(cfg) },
   });
+  if (cfg.provider !== current.provider || cfg.model !== current.model) version++;
   current = cfg;
-  version++;
+  loadedAt = Date.now();
 }

@@ -2,6 +2,7 @@ import { Router } from "express";
 import rateLimit from "express-rate-limit";
 import { z } from "zod";
 import { authed, requireAuth, requireRole } from "../../middleware/auth";
+import { parseId } from "../../lib/errors";
 import { FAMILY_ORDER, type LeagueFamily } from "./leagues";
 import { answer, arenaHome, battleState, cancelSearch, leagueRoster, pollSearch, standing, startSearch } from "./service";
 
@@ -40,15 +41,15 @@ battleRouter.post("/search", async (req, res) => {
 });
 
 battleRouter.get("/search/:ticketId", async (req, res) => {
-  res.json(await pollSearch(authed(req).id, req.params.ticketId as string));
+  res.json(await pollSearch(authed(req).id, parseId(req.params.ticketId)));
 });
 
 battleRouter.delete("/search/:ticketId", async (req, res) => {
-  res.json(await cancelSearch(authed(req).id, req.params.ticketId as string));
+  res.json(await cancelSearch(authed(req).id, parseId(req.params.ticketId)));
 });
 
 battleRouter.get("/:battleId", async (req, res) => {
-  res.json(await battleState(authed(req).id, req.params.battleId as string));
+  res.json(await battleState(authed(req).id, parseId(req.params.battleId)));
 });
 
 const AnswerBody = z.object({
@@ -57,5 +58,5 @@ const AnswerBody = z.object({
 });
 
 battleRouter.post("/:battleId/answer", async (req, res) => {
-  res.json(await answer(authed(req).id, req.params.battleId as string, AnswerBody.parse(req.body)));
+  res.json(await answer(authed(req).id, parseId(req.params.battleId), AnswerBody.parse(req.body)));
 });

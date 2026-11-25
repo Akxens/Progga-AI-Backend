@@ -3,22 +3,30 @@ import multer from "multer";
 import rateLimit from "express-rate-limit";
 import { z } from "zod";
 import { authed, requireAuth, requireRole } from "../../middleware/auth";
-import { badRequest } from "../../lib/errors";
+import { badRequest, parseId } from "../../lib/errors";
 import { jsonOrStream } from "../../lib/sse";
 import { prisma } from "../../lib/prisma";
 import * as tutor from "./service";
 import { MAX_INPUT_CHARS } from "./safety";
+import { ensureAiConfig } from "../ai/config";
 import { studentEngines, tutorFor } from "../ai/engines";
 import { sendSpeech } from "../voice/service";
 
 export const tutorRouter = Router();
-tutorRouter.use(requireAuth, requireRole("STUDENT"));
+tutorRouter.use(requireAuth, requireRole("STUDENT"), async (_req, _res, next) => {
+  await ensureAiConfig();
+  next();
+});
 
 // Photos are processed in memory and never written to disk or the database.
+const ALLOWED_IMAGE_TYPES = ["image/jpeg", "image/png", "image/webp", "image/gif"];
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 5 * 1024 * 1024, files: 1 },
-  fileFilter: (_req, file, cb) => cb(null, ["image/jpeg", "image/png", "image/webp", "image/gif"].includes(file.mimetype)),
+  fileFilter: (_req, file, cb) => {
+    if (ALLOWED_IMAGE_TYPES.includes(file.mimetype)) return cb(null, true);
+    cb(badRequest("Please upload a JPG, PNG, WebP, or GIF photo."));
+  },
 });
 
 // Per-user burst limit on AI calls (on top of the daily problem limit).
@@ -42,8 +50,14 @@ tutorRouter.get("/engines", async (_req, res) => {
   res.json({ engines: await studentEngines() });
 });
 
+const SessionsQuery = z.object({
+  q: z.string().trim().max(80).optional(),
+  cursor: z.string().trim().min(1).max(80).optional(),
+  limit: z.coerce.number().int().min(1).max(50).optional(),
+});
+
 tutorRouter.get("/sessions", async (req, res) => {
-  res.json({ sessions: await tutor.listSessions(authed(req).id) });
+  res.json(await tutor.listSessionsPage(authed(req).id, SessionsQuery.parse(req.query)));
 });
 
 tutorRouter.post("/sessions", aiLimiter, upload.single("image"), async (req, res) => {
@@ -59,21 +73,25 @@ tutorRouter.post("/sessions", aiLimiter, upload.single("image"), async (req, res
 });
 
 tutorRouter.get("/sessions/:id", async (req, res) => {
-  res.json({ session: await tutor.getSession(authed(req).id, req.params.id as string) });
+  res.json({ session: await tutor.getSession(authed(req).id, parseId(req.params.id)) });
 });
 
 tutorRouter.delete("/sessions/:id", async (req, res) => {
-  await tutor.deleteSession(authed(req).id, req.params.id as string);
+  await tutor.deleteSession(authed(req).id, parseId(req.params.id));
   res.status(204).end();
 });
 
 // "Start a lesson": pick a class, a subject and one of its NCTB topics, and Progga teaches it from scratch.
-const SyllabusQuery = z.object({ grade: z.coerce.number().int().min(3).max(12), subject: z.string().min(1).max(40) });
+const SyllabusQuery = z.object({
+  grade: z.coerce.number().int().min(3).max(12),
+  subject: z.string().min(1).max(40),
+  lang: z.enum(["en", "bn"]).optional(),
+});
 
 tutorRouter.get("/syllabus", aiLimiter, async (req, res) => {
-  const { grade, subject } = SyllabusQuery.parse(req.query);
-  const user = await prisma.user.findUniqueOrThrow({ where: { id: authed(req).id }, select: { language: true } });
-  res.json(await tutor.syllabus(grade, subject, user.language));
+  const { grade, subject, lang } = SyllabusQuery.parse(req.query);
+  const language = lang ?? (await prisma.user.findUniqueOrThrow({ where: { id: authed(req).id }, select: { language: true } })).language;
+  res.json(await tutor.syllabus(grade, subject, language));
 });
 
 const LessonBody = z.object({
@@ -100,19 +118,19 @@ const ReplyBody = z.object({ message: z.string().trim().min(1).max(MAX_INPUT_CHA
 tutorRouter.post("/sessions/:id/reply", aiLimiter, async (req, res) => {
   const { message, engine } = ReplyBody.parse(req.body);
   const llm = await tutorFor(engine);
-  await jsonOrStream(req, res, (onPreview) => tutor.reply(authed(req).id, req.params.id as string, message, onPreview, llm));
+  await jsonOrStream(req, res, (onPreview) => tutor.reply(authed(req).id, parseId(req.params.id), message, onPreview, llm));
 });
 
 tutorRouter.post("/sessions/:id/hint", async (req, res) => {
-  res.json(await tutor.hint(authed(req).id, req.params.id as string));
+  res.json(await tutor.hint(authed(req).id, parseId(req.params.id)));
 });
 
 tutorRouter.post("/sessions/:id/reveal-step", async (req, res) => {
-  res.json(await tutor.reveal(authed(req).id, req.params.id as string));
+  res.json(await tutor.reveal(authed(req).id, parseId(req.params.id)));
 });
 
 tutorRouter.post("/sessions/:id/abandon", async (req, res) => {
-  res.json({ session: await tutor.abandon(authed(req).id, req.params.id as string) });
+  res.json({ session: await tutor.abandon(authed(req).id, parseId(req.params.id)) });
 });
 
 // Read-aloud: Progga's voice for one of its messages (cached after the first request).
@@ -124,5 +142,5 @@ const speechLimiter = rateLimit({
 });
 
 tutorRouter.get("/sessions/:id/messages/:messageId/speech", speechLimiter, async (req, res) => {
-  await sendSpeech(authed(req).id, req.params.id as string, req.params.messageId as string, res);
+  await sendSpeech(authed(req).id, parseId(req.params.id), parseId(req.params.messageId), res);
 });

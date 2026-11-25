@@ -1,10 +1,10 @@
 import { Router } from "express";
 import { z } from "zod";
 import { prisma } from "../../lib/prisma";
-import { notFound } from "../../lib/errors";
+import { notFound, parseId } from "../../lib/errors";
 import { authed, requireAuth } from "../../middleware/auth";
 import { lessonCard } from "../lessons/presenter";
-import { topicStatus } from "../lessons/progress";
+import { progressRatio, topicStatus } from "../lessons/progress";
 import { loadCourseTree } from "./tree";
 
 // Class-wise NCTB courses: Course → Chapter → topic (a Lesson with a video and written notes).
@@ -29,9 +29,9 @@ coursesRouter.get("/", async (req, res) => {
   const inGrade = { unit: { course: { grade } } };
   const [subjects, courses, chapters, topics, done, quick, withCourses] = await Promise.all([
     prisma.subject.findMany({ where: { minGrade: { lte: grade }, maxGrade: { gte: grade } }, orderBy: { order: "asc" } }),
-    prisma.course.findMany({ where: { grade }, include: { subject: true }, orderBy: { order: "asc" } }),
-    prisma.chapter.findMany({ where: { course: { grade } }, select: { id: true, courseId: true } }),
-    prisma.lesson.findMany({ where: inGrade, select: { id: true, chapterId: true, durationSec: true } }),
+    prisma.course.findMany({ where: { grade, status: { not: "draft" } }, include: { subject: true }, orderBy: { order: "asc" } }),
+    prisma.chapter.findMany({ where: { course: { grade, status: { not: "draft" } }, status: { not: "draft" } }, select: { id: true, courseId: true } }),
+    prisma.lesson.findMany({ where: { ...inGrade, status: { not: "draft" } }, select: { id: true, chapterId: true, durationSec: true } }),
     prisma.lessonProgress.findMany({ where: { userId, completed: true, lesson: inGrade }, select: { lessonId: true } }),
     prisma.lesson.findMany({ where: { grade, chapterId: null }, include: { subject: true, progress: { where: { userId } } }, orderBy: { order: "asc" } }),
     prisma.course.findMany({ select: { grade: true }, distinct: ["grade"] }),
@@ -66,7 +66,7 @@ coursesRouter.get("/", async (req, res) => {
     courses: [...cards, ...soon],
     quickLessons: quick.map((l) => ({
       ...lessonCard(l),
-      progress: l.progress[0] ? Math.min(1, l.progress[0].watchedSec / l.durationSec) : 0,
+      progress: l.progress[0] ? progressRatio(l.progress[0].watchedSec, l.durationSec) : 0,
       completed: l.progress[0]?.completed ?? false,
     })),
   });
@@ -74,7 +74,7 @@ coursesRouter.get("/", async (req, res) => {
 
 /** A course page: every chapter with its topics and the student's progress through them. */
 coursesRouter.get("/:id", async (req, res) => {
-  const tree = await loadCourseTree(req.params.id as string, authed(req).id);
+  const tree = await loadCourseTree(parseId(req.params.id), authed(req).id);
   if (!tree) throw notFound("Course not found");
   const { course } = tree;
 

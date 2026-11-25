@@ -43,6 +43,26 @@ const EnvSchema = z.object({
   /** Context window (tokens) for the local model; the tutor prompt needs well over Ollama's 4096 default. */
   OLLAMA_NUM_CTX: z.coerce.number().int().positive().default(16384),
   DEFAULT_DAILY_TUTOR_LIMIT: z.coerce.number().int().positive().default(25),
+  // ── Admin & Control Centre ────────────────────────────────
+  /** 32-byte base64 encryption key for sensitive data at rest (MFA secrets, consent evidence) */
+  DATA_ENCRYPTION_KEY: z
+    .string()
+    .default(() => Buffer.from("01234567890123456789012345678901").toString("base64")),
+  /** Bearer secret used by cron workers calling /api/internal/jobs/tick */
+  CRON_SECRET: z.string().default("dev-cron-secret-change-in-production-40-chars-min"),
+  /** For local/container deployments: runs the job tick on a setInterval */
+  RUN_JOBS_IN_PROCESS: z
+    .enum(["true", "false"])
+    .default("false")
+    .transform((v) => v === "true"),
+  /** Secret used to sign and verify mock payment provider webhooks in dev/test */
+  MOCK_PAYMENT_SECRET: z.string().default("dev-mock-payment-secret"),
+  /** Payment provider driver: mock | sslcommerz | bkash */
+  PAYMENT_PROVIDER: z.enum(["mock", "sslcommerz", "bkash"]).default("mock"),
+  /** Base URL of the admin/student frontend for notification links and downloads */
+  ADMIN_APP_URL: z.string().default("http://localhost:3000"),
+  /** Number of hours generated report exports remain downloadable before cleanup */
+  REPORT_FILE_TTL_HOURS: z.coerce.number().int().positive().default(24),
 });
 
 const parsed = EnvSchema.safeParse(process.env);

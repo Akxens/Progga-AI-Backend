@@ -93,6 +93,7 @@ function fillPlanTail(schema: z.ZodType, value: unknown): unknown {
 }
 
 class FilteredError extends Error {}
+class StreamParseError extends Error {}
 
 export class ChatCompletionsTutor implements TutorLLM {
   readonly name: string;
@@ -158,7 +159,17 @@ export class ChatCompletionsTutor implements TutorLLM {
     ];
     for (let attempt = 0; attempt < 2; attempt++) {
       if (attempt > 0) onPartial?.(""); // the repaired answer streams from the start again
-      const content = await this.chat(model, messages, maxTokens, reasoning, onPartial);
+      let content: string;
+      try {
+        content = await this.chat(model, messages, maxTokens, reasoning, attempt === 0 ? onPartial : undefined);
+      } catch (err) {
+        if (err instanceof StreamParseError && attempt === 0) {
+          logger.warn({ provider: this.name, model, err: err.message }, "Malformed AI stream chunk; retrying without streaming");
+          continue;
+        }
+        if (err instanceof StreamParseError) throw new HttpError(502, "Progga got a bit confused. Please try again!", "llm_error");
+        throw err;
+      }
       let problem: string;
       try {
         const parsed = schema.safeParse(fillPlanTail(schema, extractJson(content)));
@@ -265,7 +276,7 @@ export class ChatCompletionsTutor implements TutorLLM {
       if (buffer.trim()) onLine(buffer.trim());
     } catch (err) {
       if (err instanceof HttpError) throw err;
-      if (err instanceof SyntaxError) throw new HttpError(502, "Progga got a bit confused. Please try again!", "llm_error");
+      if (err instanceof SyntaxError) throw new StreamParseError(err.message);
       logger.error({ provider: this.name, err: (err as Error).message }, "AI stream broke off");
       throw new HttpError(503, "Progga is taking too long to think. Please try again.", "llm_timeout");
     }

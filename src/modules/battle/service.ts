@@ -294,7 +294,7 @@ async function loadBattle(battleId: string, userId: string): Promise<FullBattle>
 
 export async function battleState(userId: string, battleId: string) {
   let b = await loadBattle(battleId, userId);
-  if (b.status === "live" && readyToFinish(b, Date.now())) {
+  if ((b.status === "live" || (b.status === "settling" && b.finishedAt && Date.now() - b.finishedAt.getTime() > 15_000)) && readyToFinish(b, Date.now())) {
     await finishBattle(b.id);
     b = await loadBattle(battleId, userId);
   }
@@ -377,7 +377,13 @@ const lastResult = (q: BattleQuestion, a: Answer, index: number) => ({
 
 async function finishBattle(battleId: string) {
   const at = Date.now();
-  const claimed = await prisma.battle.updateMany({ where: { id: battleId, status: "live" }, data: { status: "done", finishedAt: new Date(at) } });
+  const claimed = await prisma.battle.updateMany({
+    where: {
+      id: battleId,
+      OR: [{ status: "live" }, { status: "settling", finishedAt: { lt: new Date(at - 15_000) } }],
+    },
+    data: { status: "settling", finishedAt: new Date(at) },
+  });
   if (!claimed.count) return; // someone else is finishing it
 
   const b = await prisma.battle.findUniqueOrThrow({ where: { id: battleId }, include: { players: true } });
@@ -403,17 +409,20 @@ async function finishBattle(battleId: string) {
       continue;
     }
     const userId = me.p.userId;
-    const profile = await profileFor(userId, b.grade);
+    const ensured = await profileFor(userId, b.grade);
     // both sides use the pre-battle snapshot, so what one loses the other wins
     const delta = trophyChange(me.p.trophiesBefore, them.p.trophiesBefore, result);
-    const trophies = Math.max(0, profile.trophies + delta);
-    const form = profile.winStreak;
-    const nextForm = result === "win" ? Math.max(0, form) + 1 : result === "loss" ? Math.min(0, form) - 1 : 0;
     const correct = answersOf(me.p).filter((a) => a.correct).length;
     const xp = (result === "win" ? XP.battleWin : result === "draw" ? XP.battleDraw : XP.battlePlayed) + correct * XP.battleCorrect;
 
-    await prisma.$transaction([
-      prisma.battleProfile.update({
+    await prisma.$transaction(async (tx) => {
+      await tx.$queryRaw`SELECT id FROM "BattleProfile" WHERE id = ${ensured.id} FOR UPDATE`;
+      const profile = await tx.battleProfile.findUniqueOrThrow({ where: { id: ensured.id } });
+      const trophies = Math.max(0, profile.trophies + delta);
+      const form = profile.winStreak;
+      const nextForm = result === "win" ? Math.max(0, form) + 1 : result === "loss" ? Math.min(0, form) - 1 : 0;
+
+      await tx.battleProfile.update({
         where: { id: profile.id },
         data: {
           trophies,
@@ -424,13 +433,14 @@ async function finishBattle(battleId: string) {
           winStreak: nextForm,
           bestStreak: Math.max(profile.bestStreak, nextForm),
         },
-      }),
-      prisma.battlePlayer.update({ where: { id: me.p.id }, data: { result, trophyDelta: trophies - profile.trophies, xpGained: xp } }),
-    ]);
+      });
+      await tx.battlePlayer.update({ where: { id: me.p.id }, data: { result, trophyDelta: trophies - profile.trophies, xpGained: xp } });
+    });
     await award(userId, [{ amount: xp, reason: result === "win" ? "battle_win" : "battle_played", refId: b.id }]).catch((err) =>
       logger.error({ err }, "battle XP award failed"),
     );
   }
+  await prisma.battle.update({ where: { id: battleId }, data: { status: "done" } });
   await prisma.battleTicket.deleteMany({ where: { battleId } });
 }
 

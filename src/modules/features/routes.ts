@@ -1,5 +1,5 @@
 import { Router } from "express";
-import { requireAuth, requireRole } from "../../middleware/auth";
+import { requireAuth, requireFreshSession, requireRole } from "../../middleware/auth";
 import { FeaturesSchema, getFeatures, saveFeatures } from "./config";
 
 /** Public: which optional features the app should show. */
@@ -11,7 +11,7 @@ featuresRouter.get("/", async (_req, res) => {
 
 /** Admin-only: show or hide optional features for every student. */
 export const featuresAdminRouter = Router();
-featuresAdminRouter.use(requireAuth, requireRole("ADMIN"));
+featuresAdminRouter.use(requireAuth, requireFreshSession, requireRole("ADMIN"));
 
 featuresAdminRouter.get("/", async (_req, res) => {
   res.json({ features: await getFeatures() });

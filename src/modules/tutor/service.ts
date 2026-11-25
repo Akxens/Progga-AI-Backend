@@ -1,7 +1,7 @@
 import type { Prisma, TutorSession } from "@prisma/client";
 import { prisma } from "../../lib/prisma";
 import { dayKey, dayStartUtc } from "../../lib/dates";
-import { HttpError, badRequest, notFound, tooMany } from "../../lib/errors";
+import { HttpError, badRequest, conflict, notFound, tooMany } from "../../lib/errors";
 import { logger } from "../../lib/logger";
 import { award, type Rewards } from "../gamification/service";
 import { relatedLessons } from "../lessons/related";
@@ -23,6 +23,12 @@ import { evalPreview, planPreview, previewer, type OnPreview } from "./stream-pr
 import type { Plan, StepProgress } from "./schemas";
 
 const RECENT_MESSAGES = 8;
+const inFlightPlans = new Set<string>();
+
+const limitReachedMessage = (user: { language: string; dailyTutorLimit: number }) =>
+  user.language === "bn"
+    ? `আজ তুমি ${user.dailyTutorLimit}টা প্রশ্ন নিয়ে কাজ করেছ — দারুণ! এবার একটু বিরতি নাও, একটা ভিডিও দেখো বা কুইজ খেলো। 🍌`
+    : `You've explored ${user.dailyTutorLimit} problems today — amazing! Take a break, watch a lesson, or play Quiz Arena. 🍌`;
 
 // ── Mapping ──────────────────────────────────────────────
 
@@ -89,35 +95,67 @@ async function loadOwned(studentId: string, id: string) {
  * counts; a batch insert would add BEGIN/COMMIT trips). Each gets its own createdAt,
  * a millisecond apart, so they keep their order.
  */
-async function saveMessages(sessionId: string, role: "student" | "tutor", msgs: OutMessage[], base = Date.now()) {
-  return Promise.all(
-    msgs.map((m, i) =>
-      prisma.tutorMessage.create({
-        data: {
-          sessionId,
-          role,
-          kind: m.kind,
-          content: m.content,
-          stepIndex: m.stepIndex,
-          meta: (m.meta ?? undefined) as Prisma.InputJsonValue,
-          createdAt: new Date(base + i),
-        },
-      }),
-    ),
-  );
+async function saveMessages(
+  sessionId: string,
+  role: "student" | "tutor",
+  msgs: OutMessage[],
+  base = Date.now(),
+  db: Pick<typeof prisma, "tutorMessage"> = prisma,
+) {
+  if (!msgs.length) return [];
+  return db.tutorMessage.createManyAndReturn({
+    data: msgs.map((m, i) => ({
+      sessionId,
+      role,
+      kind: m.kind,
+      content: m.content,
+      stepIndex: m.stepIndex,
+      meta: (m.meta ?? undefined) as Prisma.InputJsonValue,
+      createdAt: new Date(base + i),
+    })),
+  });
 }
 
-async function persistState(id: string, state: SessionState, xpGained: number) {
-  return prisma.tutorSession.update({
-    where: { id },
-    data: {
-      progress: state.progress as unknown as Prisma.InputJsonValue,
-      currentStep: state.currentStep,
-      hintsUsed: state.hintsUsed,
-      wrongAttempts: state.wrongAttempts,
-      status: state.status,
-      xpEarned: { increment: xpGained },
-    },
+/**
+ * Atomically advances a tutor session and writes that turn's messages in one
+ * transaction. Concurrent turns against the same snapshot get 0 updated rows
+ * and fail cleanly with 409 instead of corrupting steps or double-awarding XP.
+ */
+async function persistTurn(
+  s: TutorSession,
+  nextState: SessionState,
+  xpGained: number,
+  tutorOutgoing: OutMessage[],
+  studentOutgoing?: OutMessage[],
+) {
+  const base = Date.now();
+  return prisma.$transaction(async (tx) => {
+    const { count } = await tx.tutorSession.updateMany({
+      where: {
+        id: s.id,
+        status: "active",
+        currentStep: s.currentStep,
+        hintsUsed: s.hintsUsed,
+        wrongAttempts: s.wrongAttempts,
+        updatedAt: s.updatedAt,
+      },
+      data: {
+        progress: nextState.progress as unknown as Prisma.InputJsonValue,
+        currentStep: nextState.currentStep,
+        hintsUsed: nextState.hintsUsed,
+        wrongAttempts: nextState.wrongAttempts,
+        status: nextState.status,
+        xpEarned: { increment: xpGained },
+        updatedAt: new Date(Math.max(base, s.updatedAt.getTime() + 1)),
+      },
+    });
+    if (count === 0) throw conflict("Progga is still working on your last turn — please try again.");
+    const updated = await tx.tutorSession.findUniqueOrThrow({ where: { id: s.id } });
+    const studentMsgs = studentOutgoing?.length ? await saveMessages(s.id, "student", studentOutgoing, base, tx) : [];
+    const tutorMsgs = tutorOutgoing.length
+      ? await saveMessages(s.id, "tutor", tutorOutgoing, base + (studentOutgoing?.length ?? 0), tx)
+      : [];
+    return { updated, studentMsgs, tutorMsgs };
   });
 }
 
@@ -174,13 +212,7 @@ export async function startSession(
   if (project && !project.custom) input = { ...input, question: user.language === "bn" ? `প্রজেক্ট: ${project.title}` : `Project: ${project.title}` };
   const teachFreely = !!learn || !!project;
 
-  if (startedToday >= user.dailyTutorLimit) {
-    throw tooMany(
-      user.language === "bn"
-        ? `আজ তুমি ${user.dailyTutorLimit}টা প্রশ্ন নিয়ে কাজ করেছ — দারুণ! এবার একটু বিরতি নাও, একটা ভিডিও দেখো বা কুইজ খেলো। 🍌`
-        : `You've explored ${user.dailyTutorLimit} problems today — amazing! Take a break, watch a lesson, or play Quiz Arena. 🍌`,
-    );
-  }
+  if (startedToday >= user.dailyTutorLimit) throw tooMany(limitReachedMessage(user));
 
   if (!input.question.trim() && !input.image) throw badRequest("Type a question or add a photo");
   const screened = screenInput(input.question, user.language);
@@ -188,60 +220,78 @@ export async function startSession(
     await logSafety(studentId, screened.category, screened.text);
     return { blocked: true as const, category: screened.category, message: screened.reply };
   }
+  if (inFlightPlans.has(studentId)) throw conflict("Progga is still reading your last question — hold on a moment! 🍌");
 
   const profile = { grade: learn?.grade ?? user.grade ?? 6, language: user.language, subject };
-  const plan = await llm.plan(
-    {
-      profile,
-      question: screened.text,
-      image: input.image,
-      lesson: lesson?.context,
-      learn: learn && { topic: learn.topic, chapter: learn.chapter },
-      project: project && (project.custom ? { ...project, brief: screened.text } : project),
-    },
-    previewer((json) => planPreview(json, { lesson: teachFreely }), onPreview),
-  );
+  let plan: Plan;
+  inFlightPlans.add(studentId);
+  try {
+    plan = await llm.plan(
+      {
+        profile,
+        question: screened.text,
+        image: input.image,
+        lesson: lesson?.context,
+        learn: learn && { topic: learn.topic, chapter: learn.chapter },
+        project: project && (project.custom ? { ...project, brief: screened.text } : project),
+      },
+      previewer((json) => planPreview(json, { lesson: teachFreely }), onPreview),
+    );
+  } finally {
+    inFlightPlans.delete(studentId);
+  }
 
-  if (plan.safety !== "ok" || (plan.mode !== "fact" && plan.steps.length === 0)) {
-    if (plan.safety !== "ok" && plan.safety !== "off_topic") await logSafety(studentId, plan.safety, screened.text);
+  if (plan.safety !== "ok") {
+    if (plan.safety !== "off_topic") await logSafety(studentId, plan.safety, screened.text);
     return {
       blocked: true as const,
       category: plan.safety,
       message: plan.safety_reply || "Let's try a school question together! 🍌",
     };
   }
+  if (plan.mode !== "fact" && plan.steps.length === 0) {
+    throw new HttpError(502, "Progga got a bit confused planning those steps. Please try again!", "llm_parse");
+  }
 
-  const session = await prisma.tutorSession.create({
-    data: {
-      studentId,
-      subject,
-      lessonId: lesson?.id,
-      grade: profile.grade,
-      mode: plan.mode,
-      kind: project ? "project" : learn ? "lesson" : "question",
-      language: user.language,
-      // a fact is answered immediately, so the session is complete from the start
-      status: plan.mode === "fact" ? "solved" : "active",
-      title: plan.title || "New adventure",
-      topic: plan.topic,
-      problemText: screened.text || "(photo)",
-      hadImage: !!input.image,
-      plan: plan as unknown as Prisma.InputJsonValue,
-      progress: newProgress(plan) as unknown as Prisma.InputJsonValue,
-    },
+  const { session, asked, opening } = await prisma.$transaction(async (tx) => {
+    await tx.$queryRaw`SELECT id FROM "User" WHERE id = ${studentId} FOR UPDATE`;
+    const countToday = await tx.tutorSession.count({ where: { studentId, createdAt: { gte: dayStartUtc(dayKey()) } } });
+    if (countToday >= user.dailyTutorLimit) throw tooMany(limitReachedMessage(user));
+
+    const created = await tx.tutorSession.create({
+      data: {
+        studentId,
+        subject,
+        lessonId: lesson?.id,
+        grade: profile.grade,
+        mode: plan.mode,
+        kind: project ? "project" : learn ? "lesson" : "question",
+        language: user.language,
+        // a fact is answered immediately, so the session is complete from the start
+        status: plan.mode === "fact" ? "solved" : "active",
+        title: plan.title || "New adventure",
+        topic: plan.topic,
+        problemText: screened.text || "(photo)",
+        hadImage: !!input.image,
+        plan: plan as unknown as Prisma.InputJsonValue,
+        progress: newProgress(plan) as unknown as Prisma.InputJsonValue,
+      },
+    });
+
+    // the question and Progga's opening are saved together; timestamps keep the question first
+    const now = Date.now();
+    const [studentAsked, tutorOpening] = await Promise.all([
+      saveMessages(
+        created.id,
+        "student",
+        [{ kind: "text", content: screened.text || (user.language === "bn" ? "📷 (প্রশ্নের ছবি পাঠিয়েছি)" : "📷 (sent a photo of the problem)"), stepIndex: undefined }],
+        now,
+        tx,
+      ),
+      saveMessages(created.id, "tutor", openingMessages(plan, { lesson: teachFreely }), now + 1, tx),
+    ]);
+    return { session: created, asked: studentAsked, opening: tutorOpening };
   });
-
-  // the question and Progga's opening are saved together; timestamps keep the question first
-  const now = Date.now();
-  const [asked, opening] = await Promise.all([
-    saveMessages(
-      session.id,
-      "student",
-      [{ kind: "text", content: screened.text || (user.language === "bn" ? "📷 (প্রশ্নের ছবি পাঠিয়েছি)" : "📷 (sent a photo of the problem)"), stepIndex: undefined }],
-      now,
-    ),
-    saveMessages(session.id, "tutor", openingMessages(plan, { lesson: teachFreely }), now + 1),
-  ]);
   // a brand-new chat holds exactly these messages, so there's nothing to read back
   return {
     blocked: false as const,
@@ -324,14 +374,43 @@ function publicMessage(m: { id: string; role: string; kind: string; content: str
   return { id: m.id, role: m.role, kind: m.kind, content: m.content, stepIndex: m.stepIndex, meta: visible, createdAt: m.createdAt };
 }
 
-export async function listSessions(studentId: string, limit = 30) {
+export interface SessionPageQuery {
+  limit?: number;
+  cursor?: string;
+  q?: string;
+}
+
+export async function listSessionsPage(studentId: string, opts: SessionPageQuery = {}) {
+  const limit = Math.min(50, Math.max(1, opts.limit ?? 30));
+  const q = opts.q?.trim();
   const rows = await prisma.tutorSession.findMany({
-    where: { studentId },
-    orderBy: { updatedAt: "desc" },
-    take: limit,
+    where: {
+      studentId,
+      ...(q
+        ? {
+            OR: [
+              { title: { contains: q, mode: "insensitive" } },
+              { topic: { contains: q, mode: "insensitive" } },
+              { subject: { contains: q, mode: "insensitive" } },
+            ],
+          }
+        : {}),
+    },
+    orderBy: [{ updatedAt: "desc" }, { id: "desc" }],
+    ...(opts.cursor ? { cursor: { id: opts.cursor }, skip: 1 } : {}),
+    take: limit + 1,
     select: { id: true, title: true, subject: true, topic: true, status: true, mode: true, kind: true, currentStep: true, xpEarned: true, updatedAt: true, plan: true },
   });
-  return rows.map(({ plan, ...r }) => ({ ...r, totalSteps: (plan as unknown as Plan).steps.length }));
+  const hasMore = rows.length > limit;
+  const page = hasMore ? rows.slice(0, limit) : rows;
+  return {
+    sessions: page.map(({ plan, ...r }) => ({ ...r, totalSteps: (plan as unknown as Plan).steps.length })),
+    nextCursor: hasMore ? page[page.length - 1].id : null,
+  };
+}
+
+export async function listSessions(studentId: string, limit = 30) {
+  return (await listSessionsPage(studentId, { limit })).sessions;
 }
 
 type ActionResult = { session: Awaited<ReturnType<typeof getSession>>; newMessages: ReturnType<typeof publicMessage>[]; rewards: Rewards | null };
@@ -357,74 +436,86 @@ export async function reply(studentId: string, id: string, raw: string, onPrevie
   s = await inLanguage(s, user.language, llm);
 
   const screened = screenInput(raw, user.language);
-  // store the reply while reading the conversation so far (both are trips to the database)
-  const [studentMsg, earlier] = await Promise.all([
-    saveMessages(id, "student", [{ kind: "text", content: screened.text, stepIndex: s.currentStep }]),
-    prisma.tutorMessage.findMany({ where: { sessionId: id }, orderBy: { createdAt: "desc" }, take: RECENT_MESSAGES + 1 }),
-  ]);
-
   if (!screened.ok) {
     await logSafety(studentId, screened.category, screened.text);
-    const tutorMsgs = await saveMessages(id, "tutor", [{ kind: "safety", content: screened.reply, stepIndex: s.currentStep }]);
-    return { session: await getSession(studentId, id), newMessages: [...studentMsg, ...tutorMsgs].map(publicMessage), rewards: null };
+    const now = Date.now();
+    const [studentMsgs, tutorMsgs] = await prisma.$transaction(async (tx) =>
+      Promise.all([
+        saveMessages(id, "student", [{ kind: "text", content: screened.text, stepIndex: s.currentStep }], now, tx),
+        saveMessages(id, "tutor", [{ kind: "safety", content: screened.reply, stepIndex: s.currentStep }], now + 1, tx),
+      ]),
+    );
+    return { session: await getSession(studentId, id), newMessages: [...studentMsgs, ...tutorMsgs].map(publicMessage), rewards: null };
   }
 
+  const earlier = await prisma.tutorMessage.findMany({ where: { sessionId: id }, orderBy: { createdAt: "desc" }, take: RECENT_MESSAGES });
   const state = toState(s);
   const step = state.plan.steps[state.currentStep];
-  // the read may or may not have seen the reply just stored: leave it out either way
-  const recent = earlier.filter((m) => m.id !== studentMsg[0].id).slice(0, RECENT_MESSAGES);
   const evaluation = soundsStuck(screened.text)
     ? { verdict: "stuck" as const, feedback: "", follow_up: "", misconception: "" }
     : await llm.evaluate(
-        {
-          profile: { grade: s.grade, language: user.language, subject: s.subject },
-          problem: s.problemText,
-          plan: state.plan,
-          stepIndex: state.currentStep,
-          step,
-          recent: recent
-            .reverse()
-            .map((m) => ({ role: m.role as "student" | "tutor", content: m.content })),
-          reply: screened.text,
-        },
-        previewer((json) => evalPreview(json, [step.expected, state.plan.final_answer]), onPreview),
-      );
+      {
+        profile: { grade: s.grade, language: user.language, subject: s.subject },
+        problem: s.problemText,
+        plan: state.plan,
+        stepIndex: state.currentStep,
+        step,
+        recent: [...earlier]
+          .reverse()
+          .map((m) => ({ role: m.role as "student" | "tutor", content: m.content })),
+        reply: screened.text,
+      },
+      previewer((json) => evalPreview(json, [step.expected, state.plan.final_answer]), onPreview),
+    );
 
   const t = applyEvaluation(state, evaluation, user.language);
   if (t.safetyCategory === "wellbeing") await logSafety(studentId, "wellbeing", screened.text);
 
   const gained = t.xp.reduce((sum, e) => sum + e.amount, 0);
   const outgoing = await withVideos(s, t.messages);
-  const [updated, tutorMsgs] = await Promise.all([persistState(id, t.state, gained), saveMessages(id, "tutor", outgoing)]);
+  const { updated, studentMsgs, tutorMsgs } = await persistTurn(
+    s,
+    t.state,
+    gained,
+    outgoing,
+    [{ kind: "text", content: screened.text, stepIndex: s.currentStep }],
+  );
   const [rewards, session] = await Promise.all([
     t.xp.length ? award(studentId, t.xp.map((e) => ({ ...e, refId: id })), { hintFreeSolve: t.hintFreeSolve }) : null,
     sessionView(updated),
   ]);
 
-  return { session, newMessages: [...studentMsg, ...tutorMsgs].map(publicMessage), rewards };
+  return { session, newMessages: [...studentMsgs, ...tutorMsgs].map(publicMessage), rewards };
 }
 
 export async function hint(studentId: string, id: string): Promise<ActionResult> {
-  const user = await prisma.user.findUniqueOrThrow({ where: { id: studentId }, select: { language: true } });
-  const s = await inLanguage(await loadOwned(studentId, id), user.language);
+  const [owned, user] = await Promise.all([
+    loadOwned(studentId, id),
+    prisma.user.findUniqueOrThrow({ where: { id: studentId }, select: { language: true } }),
+  ]);
+  const s = await inLanguage(owned, user.language);
   const r = nextHint(toState(s));
   if (!r) throw badRequest("No more hints for this step — try your best guess, or ask Progga to show this step.");
-  await persistState(id, r.state, 0);
-  const msgs = await saveMessages(id, "tutor", [r.message]);
-  return { session: await getSession(studentId, id), newMessages: msgs.map(publicMessage), rewards: null };
+  const { updated, tutorMsgs } = await persistTurn(s, r.state, 0, [r.message]);
+  return { session: await sessionView(updated), newMessages: tutorMsgs.map(publicMessage), rewards: null };
 }
 
 export async function reveal(studentId: string, id: string): Promise<ActionResult> {
-  const user = await prisma.user.findUniqueOrThrow({ where: { id: studentId }, select: { language: true } });
-  const s = await inLanguage(await loadOwned(studentId, id), user.language);
+  const [owned, user] = await Promise.all([
+    loadOwned(studentId, id),
+    prisma.user.findUniqueOrThrow({ where: { id: studentId }, select: { language: true } }),
+  ]);
+  const s = await inLanguage(owned, user.language);
   const t = revealStep(toState(s), user.language);
   if (!t) throw badRequest("Try the hints first — you might crack it! 💪");
   const gained = t.xp.reduce((sum, e) => sum + e.amount, 0);
   const outgoing = await withVideos(s, t.messages);
-  await persistState(id, t.state, gained);
-  const msgs = await saveMessages(id, "tutor", outgoing);
-  const rewards = t.xp.length ? await award(studentId, t.xp.map((e) => ({ ...e, refId: id }))) : null;
-  return { session: await getSession(studentId, id), newMessages: msgs.map(publicMessage), rewards };
+  const { updated, tutorMsgs } = await persistTurn(s, t.state, gained, outgoing);
+  const [rewards, session] = await Promise.all([
+    t.xp.length ? award(studentId, t.xp.map((e) => ({ ...e, refId: id }))) : null,
+    sessionView(updated),
+  ]);
+  return { session, newMessages: tutorMsgs.map(publicMessage), rewards };
 }
 
 export async function abandon(studentId: string, id: string) {

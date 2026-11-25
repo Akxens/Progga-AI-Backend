@@ -67,9 +67,20 @@ def tts(req: TtsRequest):
     ref_text = (VOICES / f"{req.voice}.txt").read_text(encoding="utf-8").strip()
 
     t0 = time.time()
-    with lock, torch.inference_mode():
-        audio = model(req.text, ref_audio_path=str(ref_audio), ref_text=ref_text)
+    if not lock.acquire(timeout=30):
+        raise HTTPException(503, "TTS GPU is busy; please retry shortly")
+    try:
+        with torch.inference_mode():
+            audio = model(req.text, ref_audio_path=str(ref_audio), ref_text=ref_text)
+    except RuntimeError as err:
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        raise HTTPException(503, f"TTS generation failed: {err}") from err
+    finally:
+        lock.release()
     audio = np.asarray(audio)
+    if audio.size == 0:
+        raise HTTPException(502, "TTS model returned empty audio")
     if audio.dtype == np.int16:
         audio = audio.astype(np.float32) / 32768.0
 

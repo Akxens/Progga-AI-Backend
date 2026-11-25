@@ -24,25 +24,65 @@ export interface BadgeContext {
 
 const STREAK_MILESTONES: Record<number, number> = { 3: 15, 7: 40, 14: 80, 30: 200 };
 
+type TxClient = Parameters<Parameters<typeof prisma.$transaction>[0]>[0];
+type StreakClient = Pick<TxClient, "user" | "xpEvent">;
+
 /**
- * Updates the daily streak. Must run before XP is granted so a new day's first
- * action counts toward the streak.
+ * Updates the daily streak inside a transaction using a conditional `lastActiveDate`
+ * guard so concurrent `award()` calls on the same day never grant duplicate milestone XP.
  */
-async function touchStreak(userId: string): Promise<{ streak: number; bonusXp: number }> {
-  const user = await prisma.user.findUniqueOrThrow({ where: { id: userId } });
+async function touchStreakTx(tx: StreakClient, userId: string): Promise<{ streak: number; bonusXp: number }> {
+  const user = await tx.user.findUniqueOrThrow({
+    where: { id: userId },
+    select: { streakDays: true, bestStreak: true, lastActiveDate: true },
+  });
   const today = dayKey();
   if (user.lastActiveDate === today) return { streak: user.streakDays, bonusXp: 0 };
 
   const streak = user.lastActiveDate === addDays(today, -1) ? user.streakDays + 1 : 1;
   const bonusXp = STREAK_MILESTONES[streak] ?? 0;
-  await prisma.user.update({
-    where: { id: userId },
+  const { count } = await tx.user.updateMany({
+    where: { id: userId, lastActiveDate: user.lastActiveDate },
     data: { streakDays: streak, bestStreak: Math.max(user.bestStreak, streak), lastActiveDate: today },
   });
+  if (count === 0) {
+    const current = await tx.user.findUniqueOrThrow({ where: { id: userId }, select: { streakDays: true } });
+    return { streak: current.streakDays, bonusXp: 0 };
+  }
   if (bonusXp) {
-    await prisma.xpEvent.create({ data: { userId, amount: bonusXp, reason: "streak", day: today } });
+    await tx.xpEvent.create({ data: { userId, amount: bonusXp, reason: "streak", day: today } });
   }
   return { streak, bonusXp };
+}
+
+async function awardTx(
+  tx: StreakClient,
+  userId: string,
+  events: { amount: number; reason: XpReason; refId?: string }[],
+) {
+  const day = dayKey();
+  const real = events.filter((e) => e.amount > 0);
+  const { streak, bonusXp } = await touchStreakTx(tx, userId);
+  const gained = real.reduce((s, e) => s + e.amount, 0) + bonusXp;
+  const coins = Math.floor(gained / 5);
+  const before = await tx.user.findUniqueOrThrow({ where: { id: userId }, select: { xp: true } });
+  if (real.length) {
+    await tx.xpEvent.createMany({ data: real.map((e) => ({ userId, amount: e.amount, reason: e.reason, refId: e.refId, day })) });
+  }
+  const after = await tx.user.update({
+    where: { id: userId },
+    data: { xp: { increment: gained }, coins: { increment: coins } },
+    select: { xp: true },
+  });
+  const level = levelFromXp(after.xp);
+  return {
+    xpGained: gained,
+    coinsGained: coins,
+    totalXp: after.xp,
+    level,
+    leveledUp: level > levelFromXp(before.xp),
+    streak,
+  };
 }
 
 /**
@@ -53,29 +93,9 @@ export async function award(
   events: { amount: number; reason: XpReason; refId?: string }[],
   ctx: BadgeContext = {},
 ): Promise<Rewards> {
-  const { streak, bonusXp } = await touchStreak(userId);
-  const day = dayKey();
-  const real = events.filter((e) => e.amount > 0);
-  const gained = real.reduce((s, e) => s + e.amount, 0) + bonusXp;
-  const coins = Math.floor(gained / 5);
-
-  const before = await prisma.user.findUniqueOrThrow({ where: { id: userId }, select: { xp: true } });
-  const [, after] = await prisma.$transaction([
-    prisma.xpEvent.createMany({ data: real.map((e) => ({ userId, amount: e.amount, reason: e.reason, refId: e.refId, day })) }),
-    prisma.user.update({ where: { id: userId }, data: { xp: { increment: gained }, coins: { increment: coins } } }),
-  ]);
-
+  const base = await prisma.$transaction((tx) => awardTx(tx, userId, events));
   const newBadges = await checkBadges(userId, ctx);
-  const level = levelFromXp(after.xp);
-  return {
-    xpGained: gained,
-    coinsGained: coins,
-    totalXp: after.xp,
-    level,
-    leveledUp: level > levelFromXp(before.xp),
-    streak,
-    newBadges,
-  };
+  return { ...base, newBadges };
 }
 
 async function checkBadges(userId: string, ctx: BadgeContext): Promise<BadgeDef[]> {
@@ -108,7 +128,7 @@ async function checkBadges(userId: string, ctx: BadgeContext): Promise<BadgeDef[
 
   const fresh = BADGES.filter((b) => earned[b.id] && !have.has(b.id));
   if (fresh.length) {
-    await prisma.userBadge.createMany({ data: fresh.map((b) => ({ userId, badgeId: b.id })) });
+    await prisma.userBadge.createMany({ data: fresh.map((b) => ({ userId, badgeId: b.id })), skipDuplicates: true });
   }
   return fresh;
 }
@@ -153,10 +173,19 @@ export async function claimQuest(userId: string, questId: string): Promise<Rewar
   if (!quest.complete) throw badRequest("Finish the quest first!");
   if (quest.claimed) throw conflict("Already claimed");
 
-  await prisma.questClaim.create({ data: { userId, questId, day: dayKey() } });
-  await prisma.user.update({ where: { id: userId }, data: { coins: { increment: quest.rewardCoins } } });
-  const rewards = await award(userId, [{ amount: quest.rewardXp, reason: "quest", refId: questId }]);
-  return { ...rewards, coinsGained: rewards.coinsGained + quest.rewardCoins };
+  const day = dayKey();
+  const base = await prisma.$transaction(async (tx) => {
+    try {
+      await tx.questClaim.create({ data: { userId, questId, day } });
+    } catch (err) {
+      if ((err as { code?: string }).code === "P2002") throw conflict("Already claimed");
+      throw err;
+    }
+    await tx.user.update({ where: { id: userId }, data: { coins: { increment: quest.rewardCoins } } });
+    return awardTx(tx, userId, [{ amount: quest.rewardXp, reason: "quest", refId: questId }]);
+  });
+  const newBadges = await checkBadges(userId, {});
+  return { ...base, coinsGained: base.coinsGained + quest.rewardCoins, newBadges };
 }
 
 // ── Leaderboard ──────────────────────────────────────────
@@ -223,14 +252,25 @@ export async function getShop(userId: string) {
 export async function buySkin(userId: string, skinId: string) {
   const skin = SKINS.find((s) => s.id === skinId);
   if (!skin) throw notFound("Skin not found");
-  const shop = await getShop(userId);
-  if (shop.skins.find((s) => s.id === skinId)?.owned) throw conflict("You already own this skin");
-  if (shop.coins < skin.cost) throw badRequest("Not enough Kola coins yet — keep learning! 🍌");
+  if (skin.cost === 0) throw conflict("You already own this skin");
 
-  await prisma.$transaction([
-    prisma.user.update({ where: { id: userId }, data: { coins: { decrement: skin.cost }, avatarSkin: skin.id } }),
-    prisma.userItem.create({ data: { userId, itemId: skin.id } }),
-  ]);
+  await prisma.$transaction(async (tx) => {
+    const existing = await tx.userItem.findUnique({ where: { userId_itemId: { userId, itemId: skin.id } }, select: { id: true } });
+    if (existing) throw conflict("You already own this skin");
+
+    const { count } = await tx.user.updateMany({
+      where: { id: userId, coins: { gte: skin.cost } },
+      data: { coins: { decrement: skin.cost }, avatarSkin: skin.id },
+    });
+    if (count === 0) throw badRequest("Not enough Kola coins yet — keep learning! 🍌");
+
+    try {
+      await tx.userItem.create({ data: { userId, itemId: skin.id } });
+    } catch (err) {
+      if ((err as { code?: string }).code === "P2002") throw conflict("You already own this skin");
+      throw err;
+    }
+  });
   return getShop(userId);
 }
 

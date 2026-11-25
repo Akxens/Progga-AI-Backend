@@ -3,13 +3,29 @@ import { env } from "../../config/env";
 import { HttpError, notFound } from "../../lib/errors";
 import { logger } from "../../lib/logger";
 import { prisma } from "../../lib/prisma";
-import { choiceFor, getVoiceConfig, synthesize, ttsProviderInfo, type SpeechAudio, type VoiceConfig } from "./engines";
+import { choiceFor, ensureVoiceConfig, getVoiceConfig, synthesize, ttsProviderInfo, type SpeechAudio, type VoiceConfig } from "./engines";
 import { detectLang, toSpokenText, type SpeechLang } from "./speech-text";
 
 export const voiceAvailable = () => env.VOICE_ENABLED && ttsProviderInfo(getVoiceConfig().provider).configured;
 
 /** How much the app speeds up (and so lifts) the current voice; see TtsProviderInfo.lift. */
 export const voiceLift = () => ttsProviderInfo(getVoiceConfig().provider).lift;
+
+/** Per-language playback lifts so Bangla and English voices use their own engine's lift. */
+export const voiceLifts = () => {
+  const cfg = getVoiceConfig();
+  return {
+    bn: ttsProviderInfo(cfg.provider).lift,
+    en: ttsProviderInfo(choiceFor(cfg, "en").provider).lift,
+  };
+};
+
+/** Fingerprint of the active voice config so clients invalidate cached blobs on admin changes. */
+export const voiceKey = () => {
+  const cfg = getVoiceConfig();
+  const en = choiceFor(cfg, "en");
+  return `${cfg.provider}:${cfg.voice}|${en.provider}:${en.voice}`;
+};
 
 /**
  * Version of the kid delivery directions (engines.ts kidDirections). Bump it when
@@ -137,23 +153,35 @@ function optionsFor(message: { kind: string; stepIndex: number | null }, plan: u
 /** Saved clips don't record their format: Gemini's are WAV files, the others MP3. */
 const audioType = (audio: Uint8Array) => (Buffer.from(audio.subarray(0, 4)).toString("latin1") === "RIFF" ? "audio/wav" : "audio/mpeg");
 
-/** Streams engine audio to the browser while collecting it; returns the whole clip. */
-async function pipeAudio(speech: SpeechAudio, res: ExpressResponse): Promise<Uint8Array<ArrayBuffer>> {
+/** Streams engine audio to the browser while collecting it; returns null if client aborted early. */
+async function pipeAudio(speech: SpeechAudio, res: ExpressResponse, signal?: AbortSignal): Promise<Uint8Array<ArrayBuffer> | null> {
   res.set("Content-Type", speech.contentType);
   const chunks: Uint8Array[] = [];
   try {
     for await (const chunk of speech.chunks) {
+      if (signal?.aborted || res.destroyed) return null;
       chunks.push(chunk);
-      if (!res.destroyed) res.write(chunk); // keep collecting even if the student navigated away
+      res.write(chunk);
     }
   } catch (err) {
+    if (signal?.aborted) return null;
     // the engine stopped mid-clip after audio was already sent: end the response, save nothing
     if (res.headersSent) res.destroy();
     throw err;
   }
-  if (!res.destroyed) res.end();
+  if (signal?.aborted || res.destroyed) return null;
+  res.end();
   const whole = Buffer.concat(chunks);
   return Uint8Array.from(speech.finalize ? speech.finalize(whole) : whole);
+}
+
+function abortOnClose(res: ExpressResponse) {
+  const ac = new AbortController();
+  const onClose = () => {
+    if (!res.writableEnded) ac.abort();
+  };
+  res.on("close", onClose);
+  return { signal: ac.signal, cleanup: () => res.off("close", onClose) };
 }
 
 /** Admin preview: speak any sample text with a voice before switching to it (nothing is saved). */
@@ -161,7 +189,14 @@ export async function sendPreview(cfg: VoiceConfig, sample: string, res: Express
   const text = toSpokenText(sample);
   if (!text) throw new HttpError(400, "Type something for Progga to say.", "empty_text");
   res.set("Cache-Control", "no-store");
-  await pipeAudio(await synthesize(cfg, text, detectLang(text)), res);
+  const { signal, cleanup } = abortOnClose(res);
+  try {
+    await pipeAudio(await synthesize(cfg, text, detectLang(text), signal), res, signal);
+  } catch (err) {
+    if (!signal.aborted) throw err;
+  } finally {
+    cleanup();
+  }
 }
 
 /**
@@ -171,6 +206,7 @@ export async function sendPreview(cfg: VoiceConfig, sample: string, res: Express
  * saves a copy for next time.
  */
 export async function sendSpeech(studentId: string, sessionId: string, messageId: string, res: ExpressResponse): Promise<void> {
+  const config = await ensureVoiceConfig();
   if (!voiceAvailable()) throw new HttpError(503, "Progga's voice is turned off.", "tts_disabled");
 
   const message = await prisma.tutorMessage.findUnique({
@@ -181,15 +217,15 @@ export async function sendSpeech(studentId: string, sessionId: string, messageId
     throw notFound("Message not found");
   }
 
-  const config = getVoiceConfig();
   // Bangla and English replies may use different engines: pick the one for this message
   const cfg = choiceFor(config, detectLang(message.content));
-  const { model } = ttsProviderInfo(cfg.provider);
+  const info = ttsProviderInfo(cfg.provider);
+  const { model } = info;
   // The saved clip must match the engine, voice, style AND text. OpenAI keeps its older
   // key (no engine prefix) so clips recorded before engines were selectable still count.
   const voice = `${cfg.provider === "openai" ? "" : `${cfg.provider}:`}${cfg.voice}/${VOICE_STYLE}/${SPEECH_TEXT}`;
   // the URL stays the same when an admin switches voice, so the browser must not keep old clips
-  res.set("Cache-Control", "private, no-cache");
+  res.set({ "Cache-Control": "private, no-cache", "X-Voice-Lift": String(info.lift) });
 
   if (message.speech && message.speech.voice === voice && message.speech.model === model) {
     const audio = Buffer.from(message.speech.audio);
@@ -200,7 +236,16 @@ export async function sendSpeech(studentId: string, sessionId: string, messageId
 
   const text = speechFor(message, optionsFor(message, message.session.plan));
   if (!text) throw notFound("Nothing to read");
-  const audio = await pipeAudio(await synthesize({ ...cfg, en: cfg }, text, detectLang(text)), res);
+  const { signal, cleanup } = abortOnClose(res);
+  let audio: Uint8Array<ArrayBuffer> | null = null;
+  try {
+    audio = await pipeAudio(await synthesize({ ...cfg, en: cfg }, text, detectLang(text), signal), res, signal);
+  } catch (err) {
+    if (!signal.aborted) throw err;
+  } finally {
+    cleanup();
+  }
+  if (!audio) return;
   await prisma.speechClip
     .upsert({ where: { messageId }, create: { messageId, voice, model, audio }, update: { voice, model, audio } })
     .catch((err) => logger.warn({ err: (err as Error).message, messageId }, "Could not cache speech"));

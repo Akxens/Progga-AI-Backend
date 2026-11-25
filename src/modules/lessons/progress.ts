@@ -12,6 +12,10 @@ interface LessonLike {
   xpReward: number;
 }
 
+/** Safe 0..1 watch ratio (guards reading-only lessons with durationSec === 0). */
+export const progressRatio = (watchedSec: number, durationSec: number) =>
+  durationSec > 0 ? Math.min(1, Math.max(0, watchedSec / durationSec)) : 0;
+
 /** Where a student is with one lesson/topic: the video, the written notes and the whole thing. */
 export function topicStatus(lesson: LessonLike, p: Pick<LessonProgress, "watchedSec" | "readDone" | "completed"> | null | undefined) {
   return {

@@ -1,16 +1,16 @@
 import { Router } from "express";
 import { z } from "zod";
 import { badRequest } from "../../lib/errors";
-import { requireAuth, requireRole } from "../../middleware/auth";
+import { requireAuth, requireFreshSession, requireRole } from "../../middleware/auth";
 import { buildTutor, listModels } from "../tutor/llm";
-import { AiConfigSchema, PROVIDER_IDS, getAiConfig, providerInfo, providers, saveAiConfig } from "./config";
+import { AiConfigSchema, PROVIDER_IDS, ensureAiConfig, getAiConfig, providerInfo, providers, saveAiConfig } from "./config";
 
 // Admin-only: choose which AI provider and models power Progga.
 export const aiAdminRouter = Router();
-aiAdminRouter.use(requireAuth, requireRole("ADMIN"));
+aiAdminRouter.use(requireAuth, requireFreshSession, requireRole("ADMIN"));
 
-aiAdminRouter.get("/", (_req, res) => {
-  res.json({ config: getAiConfig(), providers: providers() });
+aiAdminRouter.get("/", async (_req, res) => {
+  res.json({ config: await ensureAiConfig(), providers: providers() });
 });
 
 const ModelsQuery = z.object({ provider: z.enum(PROVIDER_IDS) });

@@ -2,7 +2,7 @@ import { Router } from "express";
 import type { Prisma, QuizAttempt } from "@prisma/client";
 import { z } from "zod";
 import { prisma } from "../../lib/prisma";
-import { badRequest, notFound } from "../../lib/errors";
+import { badRequest, conflict, notFound, parseId } from "../../lib/errors";
 import { authed, requireAuth, requireRole } from "../../middleware/auth";
 import { XP } from "../gamification/catalog";
 import { award } from "../gamification/service";
@@ -94,13 +94,12 @@ const AnswerBody = z.object({
   ms: z.coerce.number().int().min(0).max(120_000),
 });
 
-quizRouter.post("/:attemptId/answer", async (req, res) => {
-  const userId = authed(req).id;
-  const attempt = await prisma.quizAttempt.findUnique({ where: { id: req.params.attemptId as string } });
+export async function answerQuizAttempt(userId: string, attemptId: string, rawBody: unknown) {
+  const attempt = await prisma.quizAttempt.findUnique({ where: { id: attemptId } });
   if (!attempt || attempt.userId !== userId) throw notFound("Quiz not found");
   if (attempt.finishedAt) throw badRequest("This round is over");
 
-  const body = AnswerBody.parse(req.body);
+  const body = AnswerBody.parse(rawBody);
   const ids = attempt.questionIds as string[];
   const answers = attempt.answers as unknown as Answer[];
   if (ids[answers.length] !== body.questionId) throw badRequest("Answer the current question");
@@ -113,8 +112,16 @@ quizRouter.post("/:attemptId/answer", async (req, res) => {
   const nextAnswers = [...answers, { questionId: q.id, choice: body.choice, correct, ms: body.ms, points }];
   const finished = nextAnswers.length >= ids.length || hearts <= 0;
 
-  const updated = await prisma.quizAttempt.update({
-    where: { id: attempt.id },
+  // Every valid answer changes either correctCount (+1) or hearts (-1), so concurrent submits cannot settle twice.
+  const { count } = await prisma.quizAttempt.updateMany({
+    where: {
+      id: attempt.id,
+      finishedAt: null,
+      hearts: attempt.hearts,
+      correctCount: attempt.correctCount,
+      combo: attempt.combo,
+      score: attempt.score,
+    },
     data: {
       answers: nextAnswers as unknown as Prisma.InputJsonValue,
       combo,
@@ -125,6 +132,8 @@ quizRouter.post("/:attemptId/answer", async (req, res) => {
       finishedAt: finished ? new Date() : null,
     },
   });
+  if (count === 0) throw conflict("This question was already answered");
+  const updated = await prisma.quizAttempt.findUniqueOrThrow({ where: { id: attempt.id } });
 
   let rewards = null;
   let summary = null;
@@ -141,7 +150,7 @@ quizRouter.post("/:attemptId/answer", async (req, res) => {
     summary = { perfect, accuracy: updated.correctCount / ids.length, outOfHearts: hearts <= 0 && nextAnswers.length < ids.length };
   }
 
-  res.json({
+  return {
     correct,
     answerIndex: q.answerIndex,
     explanation: q.explanation,
@@ -149,7 +158,11 @@ quizRouter.post("/:attemptId/answer", async (req, res) => {
     attempt: attemptView(updated),
     rewards,
     summary,
-  });
+  };
+}
+
+quizRouter.post("/:attemptId/answer", async (req, res) => {
+  res.json(await answerQuizAttempt(authed(req).id, parseId(req.params.attemptId), req.body));
 });
 
 quizRouter.get("/history", async (req, res) => {

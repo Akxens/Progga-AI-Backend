@@ -4,15 +4,16 @@ import { z } from "zod";
 import { MobileField } from "../../lib/contact";
 import { badRequest, forbidden, HttpError, notFound } from "../../lib/errors";
 import { prisma } from "../../lib/prisma";
-import { authed, requireAuth, requireRole } from "../../middleware/auth";
+import { authed, requireAuth, requireFreshSession, requireRole } from "../../middleware/auth";
 import { getDailyQuests } from "../gamification/service";
 import { lessonCard } from "../lessons/presenter";
+import { progressRatio } from "../lessons/progress";
 import { listSessions } from "../tutor/service";
 import { publicUser } from "./presenter";
 import { Birthdate, mergeProfile, PROFILE_REWARD_COINS, profileStatus, ProfilePatch, readProfile } from "./profile";
 
 export const usersRouter = Router();
-usersRouter.use(requireAuth);
+usersRouter.use(requireAuth, requireFreshSession);
 
 const orClear = <T extends z.ZodType>(field: T) => z.union([z.literal(""), field]).optional();
 
@@ -32,38 +33,43 @@ usersRouter.patch("/", async (req, res) => {
   const me = authed(req);
   const { profile: patch, birthdate, email, phone, ...body } = UpdateBody.parse(req.body);
   if (me.role !== "STUDENT") delete body.grade;
-  const current = await prisma.user.findUniqueOrThrow({ where: { id: me.id } });
 
-  // Sign-in details: unique, and an account that signs in must keep at least one.
-  const nextEmail = email === undefined ? current.email : email || null;
-  const nextPhone = phone === undefined ? current.phone : phone || null;
-  if ((current.email || current.phone) && !nextEmail && !nextPhone) throw badRequest("Keep an email or a mobile number to sign in with");
-  if (nextEmail && nextEmail !== current.email && (await prisma.user.findUnique({ where: { email: nextEmail } })))
-    throw taken("email", "That email already has an account");
-  if (nextPhone && nextPhone !== current.phone && (await prisma.user.findUnique({ where: { phone: nextPhone } })))
-    throw taken("phone", "That mobile number already has an account");
+  const { user, reward } = await prisma.$transaction(async (tx) => {
+    await tx.$queryRaw`SELECT id FROM "User" WHERE id = ${me.id} FOR UPDATE`;
+    const current = await tx.user.findUniqueOrThrow({ where: { id: me.id } });
 
-  const profile = patch ? mergeProfile(readProfile(current), patch) : readProfile(current);
-  let user = await prisma.user.update({
-    where: { id: me.id },
-    data: {
-      ...body,
-      email: nextEmail,
-      phone: nextPhone,
-      ...(birthdate !== undefined && { birthdate: birthdate || null }),
-      ...(patch && { profile }),
-    },
-  });
+    // Sign-in details: unique, and an account that signs in must keep at least one.
+    const nextEmail = email === undefined ? current.email : email || null;
+    const nextPhone = phone === undefined ? current.phone : phone || null;
+    if ((current.email || current.phone) && !nextEmail && !nextPhone) throw badRequest("Keep an email or a mobile number to sign in with");
+    if (nextEmail && nextEmail !== current.email && (await tx.user.findUnique({ where: { email: nextEmail } })))
+      throw taken("email", "That email already has an account");
+    if (nextPhone && nextPhone !== current.phone && (await tx.user.findUnique({ where: { phone: nextPhone } })))
+      throw taken("phone", "That mobile number already has an account");
 
-  // First time a student's profile hits 100%: a one-off coin reward.
-  let reward: { coins: number } | null = null;
-  if (user.role === "STUDENT" && !profile.rewardedAt && profileStatus(user).percent === 100) {
-    user = await prisma.user.update({
+    const profile = patch ? mergeProfile(readProfile(current), patch) : readProfile(current);
+    let updated = await tx.user.update({
       where: { id: me.id },
-      data: { coins: { increment: PROFILE_REWARD_COINS }, profile: { ...profile, rewardedAt: new Date().toISOString() } },
+      data: {
+        ...body,
+        email: nextEmail,
+        phone: nextPhone,
+        ...(birthdate !== undefined && { birthdate: birthdate || null }),
+        ...(patch && { profile }),
+      },
     });
-    reward = { coins: PROFILE_REWARD_COINS };
-  }
+
+    // First time a student's profile hits 100%: a one-off coin reward (guarded by row lock).
+    let bonus: { coins: number } | null = null;
+    if (updated.role === "STUDENT" && !readProfile(updated).rewardedAt && profileStatus(updated).percent === 100) {
+      updated = await tx.user.update({
+        where: { id: me.id },
+        data: { coins: { increment: PROFILE_REWARD_COINS }, profile: { ...readProfile(updated), rewardedAt: new Date().toISOString() } },
+      });
+      bonus = { coins: PROFILE_REWARD_COINS };
+    }
+    return { user: updated, reward: bonus };
+  });
   res.json({ user: publicUser(user), reward });
 });
 
@@ -74,7 +80,10 @@ const PHOTO_TYPES = ["image/jpeg", "image/png", "image/webp"];
 const photoUpload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 1024 * 1024, files: 1 },
-  fileFilter: (_req, file, cb) => cb(null, PHOTO_TYPES.includes(file.mimetype)),
+  fileFilter: (_req, file, cb) => {
+    if (PHOTO_TYPES.includes(file.mimetype)) return cb(null, true);
+    cb(badRequest("Choose a JPG, PNG or WebP picture under 1 MB"));
+  },
 });
 
 usersRouter.put("/photo", photoUpload.single("photo"), async (req, res) => {
@@ -105,7 +114,10 @@ async function canSeePhoto(req: Request, ownerId: string) {
   const me = authed(req);
   if (me.id === ownerId || me.role === "ADMIN") return true;
   const link = await prisma.guardianLink.findFirst({
-    where: { OR: [{ guardianId: me.id, studentId: ownerId }, { guardianId: ownerId, studentId: me.id }] },
+    where: {
+      status: "active",
+      OR: [{ guardianId: me.id, studentId: ownerId }, { guardianId: ownerId, studentId: me.id }],
+    },
     select: { id: true },
   });
   return !!link;
@@ -153,7 +165,7 @@ usersRouter.get("/dashboard", requireRole("STUDENT"), async (req, res) => {
     recentSessions: sessions,
     continueLessons: inProgress.map((p) => ({
       ...lessonCard(p.lesson),
-      progress: Math.min(1, p.watchedSec / p.lesson.durationSec),
+      progress: progressRatio(p.watchedSec, p.lesson.durationSec),
     })),
     recommendedLessons: recommended.map(lessonCard),
     badgeCount,

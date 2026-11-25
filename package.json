@@ -12,10 +12,14 @@
     "test": "vitest run",
     "check:llm": "tsx scripts/check-llm.ts",
     "db:push": "prisma db push",
+    "db:migrate": "prisma migrate deploy",
     "db:seed": "tsx prisma/seed.ts",
+    "db:seed-admin": "tsx prisma/seed-admin.ts",
     "db:courses": "tsx prisma/seed-courses.ts",
+    "validate:courses": "tsx prisma/validate-courses.ts",
+    "db:cleanup": "tsx scripts/cleanup.ts",
     "db:reset": "prisma db push --force-reset && tsx prisma/seed.ts",
-    "setup": "prisma db push && tsx prisma/seed.ts"
+    "setup": "prisma migrate deploy && tsx prisma/seed.ts"
   },
   "prisma": {
     "seed": "tsx prisma/seed.ts"
@@ -39,13 +43,16 @@
     "helmet": "^8.3.0",
     "jsonwebtoken": "^9.0.3",
     "multer": "^2.4.0",
+    "otplib": "^12.0.1",
     "pino": "^10.4.0",
     "pino-pretty": "^13.2.0",
     "prisma": "^6.19.3",
+    "qrcode": "^1.5.4",
     "typescript": "^7.0.2",
     "zod": "^4.6.7"
   },
   "devDependencies": {
+    "@types/qrcode": "^1.5.6",
     "tsx": "^4.23.15",
     "vitest": "^5.0.5"
   },

@@ -17,7 +17,24 @@ const words = (s: string) =>
  * then shared keywords with the topic/problem, then the closest class.
  */
 export async function relatedLessons(q: { subject: string; grade: number; text: string }, take = 2) {
-  const lessons = await prisma.lesson.findMany({ include: { subject: true } });
+  const lessons = await prisma.lesson.findMany({
+    where: {
+      OR: [{ subjectId: q.subject }, { grade: { gte: q.grade - 2, lte: q.grade + 2 } }],
+    },
+    select: {
+      id: true,
+      subjectId: true,
+      title: true,
+      chapter: true,
+      description: true,
+      grade: true,
+      durationSec: true,
+      xpReward: true,
+      provider: true,
+      videoUrl: true,
+      subject: { select: { id: true, name: true, icon: true, color: true } },
+    },
+  });
   const want = words(q.text);
   return lessons
     .map((l) => {

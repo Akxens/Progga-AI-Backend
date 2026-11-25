@@ -65,20 +65,33 @@ export function wellbeingReply(language = "en"): string {
     : "It sounds like you might be going through something really hard. Your feelings matter so much 💛 Please talk to a trusted adult right now — a parent, a teacher, or your school counsellor. You are not alone, and asking for help is brave.";
 }
 
-const norm = (s: string) =>
-  s
-    .toLowerCase()
-    .replace(/\$|\\[a-z]+|[{}\s]/g, "")
-    .trim();
+const norm = (s: string) => {
+  let out = s.toLowerCase();
+  for (let i = 0; i < 2; i++) {
+    out = out.replace(/\\[dt]?frac\{([^{}]*)\}\{([^{}]*)\}/g, "$1/$2");
+  }
+  return out.replace(/\$|\\[a-z]+|[{}\s]/g, "").trim();
+};
+
+const escapeRe = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
 /**
  * Leak guard: makes sure the tutor's own words don't contain the secret
  * answer before the student has produced it. Only applied to answers that are
- * distinctive enough to detect reliably (short answers like "5" would cause
+ * distinctive enough to detect reliably (single digits like "5" would cause
  * false positives in ordinary sentences).
  */
 export function leaksAnswer(text: string, secret: string): boolean {
   const s = norm(secret);
-  if (s.length < 4 && !s.includes("=")) return false;
-  return norm(text).includes(s);
+  const hay = norm(text);
+  if (!s) return false;
+  if (s.includes("=")) return hay.includes(s);
+  if (/^-?\d+(?:\.\d+)?\/-?\d+(?:\.\d+)?$/.test(s)) {
+    return new RegExp(`(?<![0-9./])${escapeRe(s)}(?![0-9./])`).test(hay);
+  }
+  if (/^-?\d+(?:\.\d+)?$/.test(s) && s.length >= 2) {
+    return new RegExp(`(?<![0-9.])${escapeRe(s)}(?![0-9.])`).test(hay);
+  }
+  if (s.length < 4) return false;
+  return hay.includes(s);
 }

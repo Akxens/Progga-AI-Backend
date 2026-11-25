@@ -1,17 +1,17 @@
 import { Router } from "express";
 import { z } from "zod";
 import { badRequest } from "../../lib/errors";
-import { requireAuth, requireRole } from "../../middleware/auth";
-import { VoiceChoiceSchema, VoiceConfigSchema, getVoiceConfig, refreshIndicVoices, saveVoiceConfig, ttsProviderInfo, ttsProviders, voiceExists, type VoiceChoice } from "./engines";
+import { requireAuth, requireFreshSession, requireRole } from "../../middleware/auth";
+import { VoiceChoiceSchema, VoiceConfigSchema, ensureVoiceConfig, getVoiceConfig, refreshIndicVoices, saveVoiceConfig, ttsProviderInfo, ttsProviders, voiceExists, type VoiceChoice } from "./engines";
 import { sendPreview } from "./service";
 
 // Admin-only: choose which text-to-speech engine and voice Progga speaks with.
 export const voiceAdminRouter = Router();
-voiceAdminRouter.use(requireAuth, requireRole("ADMIN"));
+voiceAdminRouter.use(requireAuth, requireFreshSession, requireRole("ADMIN"));
 
 voiceAdminRouter.get("/", async (_req, res) => {
   await refreshIndicVoices();
-  res.json({ config: getVoiceConfig(), providers: ttsProviders() });
+  res.json({ config: await ensureVoiceConfig(true), providers: ttsProviders() });
 });
 
 function assertUsable(cfg: VoiceChoice) {

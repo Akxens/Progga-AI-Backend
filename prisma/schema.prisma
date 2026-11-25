@@ -20,11 +20,16 @@ model User {
   phone           String?  @unique // +8801XXXXXXXXX
   passwordHash    String
   name            String
-  role            String   @default("STUDENT") // STUDENT | PARENT | TEACHER | ADMIN
+  role            String   @default("STUDENT") // STUDENT | PARENT | TEACHER | ADMIN | STAFF
+  accountStatus   String   @default("active")  // invited | registered | active | suspended | closed
+  statusReason    String?                      // last suspension/closure reason (also in AuditLog)
+  statusChangedAt DateTime?
+  isTestAccount   Boolean  @default(false)     // excluded from every metric
+  lastSeenAt      DateTime?                    // last authenticated request of any kind (updated at most every 5 min)
   grade           Int? // 3..12 (11-12 = HSC). Students only.
   birthdate       String? // YYYY-MM-DD
   motivation      String? // excel | sharp | fun | help_child (picked at signup)
-  profile         Json     @default("{}") // about me, school, family, guardian… (shape in modules/users/profile.ts)
+  profile         Json     @default("{}") // about me, school, family, guardianâ€¦ (shape in modules/users/profile.ts)
   photoUpdatedAt  DateTime? // set while a profile photo exists; versions the photo URL
   language        String   @default("en") // en | bn
   avatarSkin      String   @default("classic")
@@ -52,6 +57,29 @@ model User {
   battleTicket   BattleTicket?
   battlePlayers  BattlePlayer[]
   photo          ProfilePhoto?
+
+  // Identity & Control Centre relations
+  studentProfile     StudentProfile?
+  teacherProfile     TeacherProfile?
+  staffProfile       StaffProfile?
+  roleAssignments    RoleAssignment[]
+  memberships        SchoolMembership[]
+  consentsAsStudent  Consent[]        @relation("consentStudent")
+  enrolments         Enrolment[]
+  subscriptions      Subscription[]
+  entitlement        Entitlement?
+  payments           PaymentTransaction[]
+  invoices           Invoice[]
+  beneficiaries      Beneficiary[]
+  enrolments         Enrolment[]
+  subscriptions      Subscription[]
+  entitlement        Entitlement?
+  payments           PaymentTransaction[]
+  invoices           Invoice[]
+  beneficiaries      Beneficiary[]
+
+  @@index([role, accountStatus])
+  @@index([createdAt])
 }
 
 /// Profile picture, resized on the device before upload (small square JPEG/WebP).
@@ -64,17 +92,29 @@ model ProfilePhoto {
 }
 
 model GuardianLink {
-  id         String   @id @default(cuid())
-  guardianId String
-  studentId  String
-  createdAt  DateTime @default(now())
-  guardian   User     @relation("guardian", fields: [guardianId], references: [id], onDelete: Cascade)
-  student    User     @relation("student", fields: [studentId], references: [id], onDelete: Cascade)
+  id                 String    @id @default(cuid())
+  guardianId         String
+  studentId          String
+  status             String    @default("active") // pending | active | revoked
+  relation           String?                      // father | mother | brother | sister | uncle | aunt | grandparent | other | teacher
+  isVerified         Boolean   @default(false)    // contact verified + linkage confirmed
+  verifiedAt         DateTime?
+  verificationMethod String?                      // link_code | otp_sms | otp_email | school_record | admin_override
+  canManageBilling   Boolean   @default(false)    // only true when isVerified and relation is a parent/legal guardian
+  revokedAt          DateTime?
+  revokedById        String?                      // soft ref
+  revokedReason      String?
+  createdAt          DateTime  @default(now())
+  updatedAt          DateTime  @default(now()) @updatedAt
+  guardian           User      @relation("guardian", fields: [guardianId], references: [id], onDelete: Cascade)
+  student            User      @relation("student", fields: [studentId], references: [id], onDelete: Cascade)
+  consents           Consent[]
 
   @@unique([guardianId, studentId])
+  @@index([studentId, status])
 }
 
-// ── Socratic tutor ───────────────────────────────────────
+// â”€â”€ Socratic tutor â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 model TutorSession {
   id            String         @id @default(cuid())
@@ -153,7 +193,7 @@ model SafetyEvent {
   @@index([userId, createdAt])
 }
 
-// ── Gamification ─────────────────────────────────────────
+// â”€â”€ Gamification â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 model XpEvent {
   id        String   @id @default(cuid())
@@ -200,7 +240,7 @@ model QuestClaim {
   @@unique([userId, questId, day])
 }
 
-// ── App settings (e.g. which AI provider/model is active) ──
+// â”€â”€ App settings (e.g. which AI provider/model is active) â”€â”€
 
 model AppSetting {
   key       String   @id
@@ -208,7 +248,7 @@ model AppSetting {
   updatedAt DateTime @updatedAt
 }
 
-// ── Content: subjects, video lessons, quizzes ────────────
+// â”€â”€ Content: subjects, video lessons, quizzes â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 model Subject {
   id        String         @id // slug: math, science, ...
@@ -226,35 +266,45 @@ model Subject {
 
 // A class-wise subject course that follows the NCTB textbook: Course → Chapter → Lesson (topic).
 model Course {
-  id          String    @id // slug: physics-10
+  id          String      @id // slug: physics-10
+  code        String?     @unique
+  status      String      @default("draft") // draft | in_review | published | archived
   subjectId   String
   grade       Int
   title       String
-  titleBn     String    @default("")
-  book        String    @default("") // NCTB textbook the chapters follow
-  description String    @default("")
-  order       Int       @default(0)
-  subject     Subject   @relation(fields: [subjectId], references: [id])
+  titleBn     String      @default("")
+  book        String      @default("") // NCTB textbook the chapters follow
+  description String      @default("")
+  order       Int         @default(0)
+  version     Int         @default(1)
+  createdAt   DateTime    @default(now())
+  updatedAt   DateTime    @default(now()) @updatedAt
+  subject     Subject     @relation(fields: [subjectId], references: [id])
   chapters    Chapter[]
+  enrolments  Enrolment[]
 
   @@unique([subjectId, grade])
 }
 
 model Chapter {
-  id       String   @id // physics-10-ch2
-  courseId String
-  number   Int // NCTB chapter number
-  title    String
-  titleBn  String   @default("")
-  summary  String   @default("")
-  course   Course   @relation(fields: [courseId], references: [id], onDelete: Cascade)
-  lessons  Lesson[]
+  id        String   @id // physics-10-ch2
+  courseId  String
+  number    Int // NCTB chapter number
+  title     String
+  titleBn   String   @default("")
+  summary   String   @default("")
+  status    String   @default("draft")
+  updatedAt DateTime @default(now()) @updatedAt
+  course    Course   @relation(fields: [courseId], references: [id], onDelete: Cascade)
+  lessons   Lesson[]
 
   @@unique([courseId, number])
 }
 
 model Lesson {
   id          String           @id @default(cuid())
+  code        String?          @unique
+  status      String           @default("draft") // draft | in_review | published | archived
   subjectId   String
   grade       Int
   chapter     String
@@ -271,10 +321,12 @@ model Lesson {
   body        String           @default("")
   readingMin  Int              @default(0)
   createdAt   DateTime         @default(now())
+  updatedAt   DateTime         @default(now()) @updatedAt
   subject     Subject          @relation(fields: [subjectId], references: [id])
   unit        Chapter?         @relation(fields: [chapterId], references: [id], onDelete: SetNull)
   progress    LessonProgress[]
   questions   TutorSession[]
+  materials   LessonMaterial[]
 
   @@index([subjectId, grade])
   @@index([chapterId, order])
@@ -329,7 +381,7 @@ model QuizAttempt {
   @@index([userId, createdAt])
 }
 
-// ── Battle Arena (1v1 live quiz battles, one trophy league per class) ──
+// â”€â”€ Battle Arena (1v1 live quiz battles, one trophy league per class) â”€â”€
 
 /// A student's trophies and record in one class's league.
 model BattleProfile {
@@ -341,7 +393,7 @@ model BattleProfile {
   wins         Int      @default(0)
   losses       Int      @default(0)
   draws        Int      @default(0)
-  winStreak    Int      @default(0) // current form: +3 = three wins in a row, −2 = two losses in a row
+  winStreak    Int      @default(0) // current form: +3 = three wins in a row, âˆ’2 = two losses in a row
   bestStreak   Int      @default(0)
   updatedAt    DateTime @updatedAt
   user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
@@ -392,7 +444,7 @@ model BattlePlayer {
   trophiesBefore    Int
   answers           Json      @default("[]") // [{ choice, correct, ms, at }]; a bot's are planned ahead with `at` = ms after start
   answered          Int       @default(0) // questions answered (or timed out) so far
-  score2            Int       @default(0) // score × 2 (correct +2, wrong −1) so −0.5 stays an integer
+  score2            Int       @default(0) // score Ã— 2 (correct +2, wrong âˆ’1) so âˆ’0.5 stays an integer
   totalMs           Int       @default(0) // thinking time, the tie-breaker
   questionStartedAt DateTime
   finishedAt        DateTime?
@@ -404,4 +456,1458 @@ model BattlePlayer {
 
   @@index([battleId])
   @@index([userId, battleId])
+}
+
+// â”€â”€ Control Centre: Identity & Access â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+/// Legal entities whose books must never be merged. Seeded: ltd, foundation.
+model LegalEntity {
+  id        String   @id // "ltd" | "foundation"
+  name      String   // "Progga Technologies Ltd." | "Progga Foundation"
+  type      String   // company | foundation
+  currency  String   @default("BDT")
+  createdAt DateTime @default(now())
+}
+
+/// Portal-specific data for STAFF/ADMIN users.
+model StaffProfile {
+  userId             String    @id
+  title              String    @default("")      // job title
+  department         String    @default("")
+  mfaSecretEnc       String?                      // AES-256-GCM ciphertext (base64) of TOTP secret
+  mfaEnrolledAt      DateTime?
+  recoveryCodeHashes String[]  @default([])       // bcrypt hashes, removed when used
+  lastAssignmentId   String?                      // last workspace used (convenience only)
+  mustChangePassword Boolean   @default(false)    // true for staff created with a temporary password
+  invitedById        String?
+  invitedAt          DateTime?
+  createdAt          DateTime  @default(now())
+  updatedAt          DateTime  @updatedAt
+  version            Int       @default(1)
+  user               User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model Role {
+  id            String   @id @default(cuid())
+  key           String   @unique // SUPER_ADMIN, EXECUTIVE, ... (UPPER_SNAKE)
+  name          String
+  description   String   @default("")
+  permissions   String[] // permission codes from src/admin/core/permissions.ts
+  allowedScopes String[] // subset of GLOBAL | LEGAL_ENTITY | SCHOOL | PROGRAMME | PARTNER
+  isSystem      Boolean  @default(false) // seeded roles cannot be edited or deleted
+  status        String   @default("active") // active | retired
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+  version       Int      @default(1)
+  assignments   RoleAssignment[]
+}
+
+/// One role granted to one user within one scope = one "workspace".
+model RoleAssignment {
+  id          String    @id @default(cuid())
+  userId      String
+  roleId      String
+  scopeType   String    // GLOBAL | LEGAL_ENTITY | SCHOOL | PROGRAMME | PARTNER
+  scopeId     String?   // null for GLOBAL; legalEntityId / schoolId / programmeId / partnerId otherwise
+  status      String    @default("active") // active | suspended | revoked
+  validFrom   DateTime  @default(now())
+  validTo     DateTime?
+  reason      String    @default("")
+  grantedById String?
+  revokedById String?
+  revokedAt   DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  version     Int       @default(1)
+  user        User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  role        Role      @relation(fields: [roleId], references: [id])
+
+  @@unique([userId, roleId, scopeType, scopeId])
+  @@index([userId, status])
+}
+
+/// Guardian-consent policy texts. A consent is always given against one version.
+model ConsentPolicy {
+  id            String   @id @default(cuid())
+  consentType   String   // data_processing | ai_tutoring | progress_reports | marketing_to_guardian
+  version       String   // "2026.1"
+  title         String
+  bodyMarkdown  String
+  effectiveFrom DateTime @db.Date
+  status        String   @default("draft") // draft | active | superseded
+  createdById   String?
+  createdAt     DateTime @default(now())
+  consents      Consent[]
+
+  @@unique([consentType, version])
+}
+
+/// Append-style consent record: a grant row is never edited except to set revoke fields once.
+model Consent {
+  id              String    @id @default(cuid())
+  studentId       String
+  guardianLinkId  String?   // null when consent recorded by school under agreement
+  policyId        String
+  consentType     String    // copy of policy.consentType for querying
+  status          String    // granted | revoked
+  method          String    // in_app | paper_form | school_agreement | sms_otp
+  evidenceEnc     String?   // AES-GCM encrypted evidence note / file id
+  grantedAt       DateTime  @default(now())
+  revokedAt       DateTime?
+  revokedReason   String?
+  recordedById    String?   // staff who recorded a paper consent
+  student         User      @relation("consentStudent", fields: [studentId], references: [id], onDelete: Cascade)
+  guardianLink    GuardianLink? @relation(fields: [guardianLinkId], references: [id], onDelete: SetNull)
+  policy          ConsentPolicy @relation(fields: [policyId], references: [id])
+
+  @@index([studentId, consentType, status])
+}
+
+model GuardianInvite {
+  id          String    @id @default(cuid())
+  studentId   String
+  contact     String    // normalized email or +8801XXXXXXXXX
+  relation    String
+  tokenHash   String    @unique // sha256 of the invite token
+  status      String    @default("sent") // sent | accepted | expired | cancelled
+  expiresAt   DateTime
+  sentById    String?
+  acceptedAt  DateTime?
+  createdAt   DateTime  @default(now())
+
+  @@index([studentId, status])
+}
+
+// â”€â”€ Control Centre: People & Institutions â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+model StudentProfile {
+  userId                 String    @id
+  code                   String    @unique // STU-000123
+  schoolId               String?   // current school (denormalized from active SchoolMembership)
+  division               String?
+  district               String?   // copied from User.profile.district on backfill; admin-editable
+  upazila                String?
+  section                String?
+  effectiveAccess        String    @default("FREE") // FREE | PREMIUM_PAID | PREMIUM_SPONSORED (cached; recomputed by entitlement service)
+  effectiveEntitlementId String?   // the Entitlement row that won
+  guardianStatus         String    @default("none") // none | invited | linked_unverified | verified | consent_revoked (cached)
+  acquisitionSource      String?   // organic | school | referral | campaign | sponsor | import
+  acquisitionCampaign    String?
+  referrerUserId         String?
+  attributionVersion     String    @default("v1")
+  firstActiveAt          DateTime?
+  lastActiveAt           DateTime? // last meaningful activity (not passive login)
+  createdAt              DateTime  @default(now())
+  updatedAt              DateTime  @updatedAt
+  version                Int       @default(1)
+  user                   User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  school                 School?   @relation(fields: [schoolId], references: [id], onDelete: SetNull)
+
+  @@index([schoolId])
+  @@index([effectiveAccess])
+  @@index([district])
+  @@index([lastActiveAt])
+}
+
+model TeacherProfile {
+  userId             String              @id
+  code               String              @unique // TCH-000045
+  status             String              @default("active") // invited | active | inactive | suspended
+  verificationStatus String              @default("unverified") // unverified | pending | verified | rejected
+  verifiedAt         DateTime?
+  verifiedById       String?
+  primarySchoolId    String?
+  subjectIds         String[]            @default([]) // Subject.id slugs
+  grades             Int[]               @default([]) // classes taught 3..12
+  district           String?
+  upazila            String?
+  lastActiveAt       DateTime?
+  createdAt          DateTime            @default(now())
+  updatedAt          DateTime            @updatedAt
+  version            Int                 @default(1)
+  user               User                @relation(fields: [userId], references: [id], onDelete: Cascade)
+  primarySchool      School?             @relation(fields: [primarySchoolId], references: [id], onDelete: SetNull)
+  assignments        TeacherAssignment[]
+  trainingEnrolments TrainingEnrolment[]
+
+  @@index([primarySchoolId, status])
+}
+
+model School {
+  id                 String              @id @default(cuid())
+  code               String              @unique // SCH-000012
+  name               String
+  nameBn             String              @default("")
+  eiin               String?             @unique // Bangladesh EIIN, 6 digits, optional
+  type               String              // government | non_government | madrasa | english_medium | technical | other
+  level              String              @default("secondary") // primary | secondary | higher_secondary | combined
+  division           String
+  district           String
+  upazila            String
+  address            String              @default("")
+  contactName        String              @default("")
+  contactPhone       String              @default("")
+  contactEmail       String              @default("")
+  onboardingStage    String              @default("created") // created | identifiers_verified | admin_nominated | members_imported | guardian_process_confirmed | entitlements_assigned | activated | adoption_review
+  status             String              @default("active") // active | inactive | archived
+  verifiedAt         DateTime?
+  verifiedById       String?
+  nameKey            String              // lowercased, whitespace-collapsed name used for duplicate detection
+  createdById        String?
+  archivedAt         DateTime?
+  createdAt          DateTime            @default(now())
+  updatedAt          DateTime            @updatedAt
+  version            Int                 @default(1)
+  students           StudentProfile[]
+  teachers           TeacherProfile[]
+  memberships        SchoolMembership[]
+  teacherAssignments TeacherAssignment[]
+  aiClubs            AiClub[]
+  activationEvents   ActivationEvent[]
+
+  @@unique([nameKey, district, upazila]) // duplicate institution check
+  @@index([district, upazila])
+  @@index([status, onboardingStage])
+}
+
+/// Date-effective membership. A transfer ends one row (endDate) and starts another.
+model SchoolMembership {
+  id          String    @id @default(cuid())
+  schoolId    String
+  userId      String
+  memberType  String    // STUDENT | TEACHER | SCHOOL_ADMIN | CAMPUS_LEADER
+  grade       Int?      // students: class at time of membership
+  section     String?
+  startDate   DateTime  @db.Date
+  endDate     DateTime? @db.Date // null = current
+  status      String    @default("active") // active | ended
+  endReason   String?   // transfer | graduated | left | correction
+  createdById String?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  school      School    @relation(fields: [schoolId], references: [id])
+  user        User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([schoolId, memberType, status])
+  @@index([userId, memberType, status])
+}
+
+model TeacherAssignment {
+  id            String         @id @default(cuid())
+  teacherUserId String
+  schoolId      String
+  subjectId     String?
+  grade         Int?
+  section       String?
+  courseId      String?
+  status        String         @default("pending") // pending | approved | rejected | ended
+  approvalId    String?
+  startDate     DateTime       @db.Date
+  endDate       DateTime?      @db.Date
+  requestedById String?
+  createdAt     DateTime       @default(now())
+  updatedAt     DateTime       @updatedAt
+  version       Int            @default(1)
+  teacher       TeacherProfile @relation(fields: [teacherUserId], references: [userId], onDelete: Cascade)
+  school        School         @relation(fields: [schoolId], references: [id])
+
+  @@index([teacherUserId, status])
+  @@index([schoolId, status])
+}
+
+model TrainingProgramme {
+  id               String            @id @default(cuid())
+  code             String            @unique // TRP-000003
+  title            String
+  description      String            @default("")
+  provider         String            @default("Progga")
+  totalSessions    Int               // used for attendance %
+  minAttendancePct Int               @default(80) // completion rule
+  passMark         Int?              // assessment pass mark 0..100; null = no assessment
+  certificateTitle String            @default("")
+  status           String            @default("draft") // draft | active | archived
+  createdById      String?
+  createdAt        DateTime          @default(now())
+  updatedAt        DateTime          @updatedAt
+  version          Int               @default(1)
+  cohorts          TrainingCohort[]
+}
+
+model TrainingCohort {
+  id            String             @id @default(cuid())
+  programmeId   String
+  name          String
+  trainerName   String
+  trainerUserId String?
+  startDate     DateTime           @db.Date
+  endDate       DateTime           @db.Date
+  location      String             @default("")
+  mode          String             @default("in_person") // in_person | online | hybrid
+  capacity      Int
+  status        String             @default("scheduled") // scheduled | in_progress | completed | cancelled
+  createdAt     DateTime           @default(now())
+  updatedAt     DateTime           @updatedAt
+  version       Int                @default(1)
+  programme     TrainingProgramme  @relation(fields: [programmeId], references: [id], onDelete: Cascade)
+  enrolments    TrainingEnrolment[]
+
+  @@index([programmeId, status])
+}
+
+model TrainingEnrolment {
+  id                  String         @id @default(cuid())
+  cohortId            String
+  teacherUserId       String
+  sessionsAttended    Int            @default(0)
+  assessmentScore     Int?           // 0..100
+  status              String         @default("enrolled") // enrolled | completed | failed | withdrawn
+  completedAt         DateTime?
+  certificateCode     String?        @unique // CRT-000010
+  certificateIssuedAt DateTime?
+  createdAt           DateTime       @default(now())
+  updatedAt           DateTime       @updatedAt
+  cohort              TrainingCohort @relation(fields: [cohortId], references: [id], onDelete: Cascade)
+  teacher             TeacherProfile @relation(fields: [teacherUserId], references: [userId], onDelete: Cascade)
+
+  @@unique([cohortId, teacherUserId])
+  @@index([teacherUserId, status])
+}
+
+model AiClub {
+  id           String    @id @default(cuid())
+  schoolId     String
+  name         String
+  leaderUserId String?   // campus leader
+  programmeId  String?
+  status       String    @default("active") // active | inactive
+  startedOn    DateTime  @db.Date
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+  school       School    @relation(fields: [schoolId], references: [id], onDelete: Cascade)
+
+  @@index([schoolId, status])
+}
+
+model ActivationEvent {
+  id              String                 @id @default(cuid())
+  code            String                 @unique // ACT-000020
+  schoolId        String?
+  programmeId     String?
+  type            String                 // campus_leader_session | ai_club_meeting | parent_session | teacher_session | community_event
+  title           String
+  eventDate       DateTime               @db.Date
+  division        String
+  district        String
+  upazila         String                 @default("")
+  registeredCount Int                    @default(0)
+  evidenceFileIds String[]               @default([])
+  notes           String                 @default("")
+  status          String                 @default("planned") // planned | completed | cancelled
+  createdById     String?
+  createdAt       DateTime               @default(now())
+  updatedAt       DateTime               @updatedAt
+  version         Int                    @default(1)
+  school          School?                @relation(fields: [schoolId], references: [id], onDelete: SetNull)
+  attendance      ActivationAttendance[]
+
+  @@index([eventDate, type])
+  @@index([schoolId, eventDate])
+}
+
+model ActivationAttendance {
+  id              String          @id @default(cuid())
+  eventId         String
+  participantKey  String
+  userId          String?
+  participantType String          // student | teacher | guardian | community
+  verified        Boolean         @default(false)
+  createdAt       DateTime        @default(now())
+  event           ActivationEvent @relation(fields: [eventId], references: [id], onDelete: Cascade)
+
+  @@unique([eventId, participantKey])
+  @@index([eventId, participantType])
+}
+
+/// Bulk import (students, teachers, schools, questions, beneficiaries, curriculum).
+model ImportJob {
+  id           String    @id @default(cuid())
+  code         String    @unique // IMP-000007
+  type         String    // students | teachers | schools | questions | beneficiaries | curriculum
+  status       String    @default("uploaded") // uploaded | validating | validated | approved | processing | completed | failed | cancelled
+  fileId       String    // StoredFile with original CSV/XLSX
+  fileName     String
+  context      Json      @default("{}") // e.g. { schoolId, programmeId, curriculumVersionId }
+  totalRows    Int       @default(0)
+  validRows    Int       @default(0)
+  invalidRows  Int       @default(0)
+  createdRows  Int       @default(0)
+  skippedRows  Int       @default(0)
+  errors       Json      @default("[]") // [{ row: 7, field: "grade", code: "out_of_range", message: "Class must be 3-12" }]
+  uploadedById String
+  approvedById String?
+  approvedAt   DateTime?
+  completedAt  DateTime?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  @@index([type, status])
+}
+
+// â”€â”€ Control Centre: Operations & Approvals â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+model Approval {
+  id                 String    @id @default(cuid())
+  code               String    @unique // APR-000001
+  type               String    // plan_version | refund | ai_routing | expense | programme | grant_agreement | programme_amendment | inter_entity_foundation | inter_entity_final | exam_regrade | teacher_assignment | content_review | manual_entitlement | period_reopen | beneficiary_pii_access
+  entityType         String
+  entityId           String
+  legalEntityId      String?
+  summary            String    // one-line human description
+  payload            Json      @default("{}") // snapshot needed for decision
+  requiredPermission String    // permission the decider must hold
+  status             String    @default("pending") // pending | approved | rejected | cancelled
+  requestedById      String
+  decidedById        String?
+  decidedAt          DateTime?
+  decisionReason     String?
+  createdAt          DateTime  @default(now())
+  updatedAt          DateTime  @updatedAt
+  version            Int       @default(1)
+
+  @@index([status, type])
+  @@index([entityType, entityId])
+}
+
+/// Work-queue assignment (DASH-03) for any queue item.
+model WorkAssignment {
+  id           String   @id @default(cuid())
+  itemType     String   // payment_review | refund | content_review | safety_case | sponsorship_expiry | incident | approval | ticket
+  itemId       String
+  assigneeId   String
+  assignedById String
+  status       String   @default("open") // open | done
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  @@unique([itemType, itemId])
+  @@index([assigneeId, status])
+}
+
+model StoredFile {
+  id            String    @id @default(cuid())
+  purpose       String    // report | import | evidence | invoice | material | consent
+  fileName      String
+  mime          String
+  sizeBytes     Int
+  sha256        String
+  storageDriver String    @default("db")
+  data          Bytes?
+  storageKey    String?
+  sensitivity   String    @default("internal") // public | internal | restricted
+  expiresAt     DateTime?
+  createdById   String?
+  createdAt     DateTime  @default(now())
+  tokens        DownloadToken[]
+
+  @@index([purpose, createdAt])
+}
+
+model DownloadToken {
+  id             String     @id @default(cuid())
+  fileId         String
+  tokenHash      String     @unique
+  issuedToUserId String
+  expiresAt      DateTime
+  downloads      Int        @default(0)
+  createdAt      DateTime   @default(now())
+  file           StoredFile @relation(fields: [fileId], references: [id], onDelete: Cascade)
+}
+
+/// Append-only (trigger blocks UPDATE/DELETE).
+model AuditLog {
+  id            String   @id @default(cuid())
+  actorUserId   String?  // null = system
+  assignmentId  String?
+  roleKey       String?
+  action        String   // e.g. student.suspend, refund.approve, report.export, file.download, role.assign
+  entityType    String
+  entityId      String
+  reason        String?
+  before        Json?
+  after         Json?
+  ip            String?
+  userAgent     String?
+  correlationId String?
+  createdAt     DateTime @default(now())
+
+  @@index([entityType, entityId, createdAt])
+  @@index([actorUserId, createdAt])
+  @@index([action, createdAt])
+  @@index([createdAt])
+}
+
+model IdempotencyKey {
+  key            String   @id
+  userId         String
+  route          String
+  requestHash    String
+  responseStatus Int
+  responseBody   Json
+  createdAt      DateTime @default(now())
+
+  @@index([createdAt])
+}
+
+model Event {
+  id            String   @id
+  eventType     String
+  occurredAt    DateTime
+  receivedAt    DateTime @default(now())
+  userId        String?
+  sessionId     String?
+  schoolId      String?
+  programmeId   String?
+  legalEntityId String?
+  schemaVersion Int      @default(1)
+  correlationId String?
+  source        String
+  properties    Json     @default("{}")
+
+  @@index([eventType, occurredAt])
+  @@index([userId, occurredAt])
+  @@index([sessionId])
+}
+
+model LearningSession {
+  id              String    @id @default(cuid())
+  code            String    @unique
+  userId          String
+  startedAt       DateTime
+  lastHeartbeatAt DateTime
+  endedAt         DateTime?
+  activeSeconds   Int       @default(0)
+  deviceCategory  String
+  platform        String    @default("web")
+  appVersion      String    @default("1.0.0")
+  module          String
+  lessonId        String?
+  isFinalized     Boolean   @default(false)
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  @@index([userId, startedAt])
+  @@index([isFinalized, lastHeartbeatAt])
+}
+
+model Outbox {
+  id            String    @id @default(cuid())
+  topic         String
+  payload       Json
+  status        String    @default("pending")
+  attempts      Int       @default(0)
+  nextAttemptAt DateTime  @default(now())
+  lastError     String?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  @@index([status, nextAttemptAt])
+}
+
+model Job {
+  id          String    @id @default(cuid())
+  type        String
+  payload     Json      @default("{}")
+  status      String    @default("queued")
+  runAt       DateTime  @default(now())
+  attempts    Int       @default(0)
+  maxAttempts Int       @default(5)
+  lockedAt    DateTime?
+  lastError   String?
+  finishedAt  DateTime?
+  createdAt   DateTime  @default(now())
+
+  @@index([status, runAt])
+}
+
+model JobSchedule {
+  id           String   @id @default(cuid())
+  type         String   @unique
+  everyMinutes Int
+  atHourDhaka  Int?
+  nextRunAt    DateTime
+  enabled      Boolean  @default(true)
+}
+
+model DailyMetric {
+  id            String   @id @default(cuid())
+  day           DateTime @db.Date
+  metricKey     String
+  dimension     String   @default("all")
+  value         Decimal  @db.Decimal(18, 4)
+  metricVersion Int      @default(1)
+  computedAt    DateTime @default(now())
+
+  @@unique([day, metricKey, dimension, metricVersion])
+  @@index([metricKey, day])
+}
+
+model SystemHealthSample {
+  id                String   @id @default(cuid())
+  sampledAt         DateTime @default(now())
+  service           String   @default("progga-api")
+  dbOk              Boolean
+  dbLatencyMs       Int
+  aiOk              Boolean
+  aiLatencyMs       Int
+  aiProvider        String
+  voiceOk           Boolean
+  voiceKey          String
+  memoryMb          Int
+  activeSessions15m Int
+}
+
+model SystemAlert {
+  id           String    @id @default(cuid())
+  severity     String
+  source       String
+  message      String
+  details      Json      @default("{}")
+  acknowledged Boolean   @default(false)
+  ackById      String?
+  ackAt        DateTime?
+  createdAt    DateTime  @default(now())
+
+  @@index([severity, acknowledged])
+}
+
+// ── LMS Extensions (Sprint 3 / Phase 4) ──────────────────────────
+
+model LessonMaterial {
+  id        String   @id @default(cuid())
+  lessonId  String
+  title     String
+  fileType  String   // pdf | slide | doc | worksheet
+  fileUrl   String
+  fileSize  Int      @default(0)
+  createdAt DateTime @default(now())
+  lesson    Lesson   @relation(fields: [lessonId], references: [id], onDelete: Cascade)
+
+  @@index([lessonId])
+}
+
+model Curriculum {
+  id          String   @id @default(cuid())
+  code        String   @unique // CUR-2026-01
+  name        String
+  grade       Int
+  description String   @default("")
+  status      String   @default("active") // active | draft | archived
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}
+
+model Enrolment {
+  id              String    @id @default(cuid())
+  studentId       String
+  courseId        String
+  status          String    @default("active") // active | completed | dropped
+  progressPct     Int       @default(0)
+  activeWatchSec  Int       @default(0)
+  completedAt     DateTime?
+  certificateCode String?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+  user            User      @relation(fields: [studentId], references: [id], onDelete: Cascade)
+  course          Course    @relation(fields: [courseId], references: [id], onDelete: Cascade)
+
+  @@unique([studentId, courseId])
+  @@index([studentId, status])
+}
+
+model ContentReview {
+  id            String    @id @default(cuid())
+  targetType    String    // COURSE | LESSON
+  targetId      String
+  version       Int       @default(1)
+  status        String    @default("pending") // pending | approved | rejected
+  submittedById String
+  reviewerId    String?
+  reviewNotes   String?
+  diffSummary   Json?
+  reviewedAt    DateTime?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  @@index([targetType, targetId])
+  @@index([status])
+}
+
+// ── Billing, Payments & Entitlements (Sprint 3 / Phase 4) ────────
+
+model Plan {
+  id          String        @id @default(cuid())
+  code        String        @unique // PLN-000001
+  name        String
+  description String        @default("")
+  accessType  String        @default("FREE") // FREE | PREMIUM_PAID | PREMIUM_SPONSORED
+  status      String        @default("active") // active | draft | archived
+  createdAt   DateTime      @default(now())
+  updatedAt   DateTime      @updatedAt
+  versions    PlanVersion[]
+}
+
+model PlanVersion {
+  id                 String         @id @default(cuid())
+  planId             String
+  versionNumber      Int            @default(1)
+  priceAmount        Decimal        @db.Decimal(10, 2)
+  currency           String         @default("BDT")
+  billingInterval    String         @default("month") // month | year | one_time
+  trialDays          Int            @default(0)
+  quotas             Json           // { dailyTutorLimit: 100, voiceMinutesPerDay: 30, battleEnabled: true }
+  status             String         @default("active") // draft | active | archived
+  effectiveFrom      DateTime       @default(now())
+  effectiveTo        DateTime?
+  createdAt          DateTime       @default(now())
+  updatedAt          DateTime       @updatedAt
+  plan               Plan           @relation(fields: [planId], references: [id], onDelete: Cascade)
+  subscriptions      Subscription[]
+
+  @@unique([planId, versionNumber])
+}
+
+model Subscription {
+  id                 String               @id @default(cuid())
+  code               String               @unique // SUB-000001
+  studentId          String
+  planVersionId      String
+  status             String               @default("active") // trialing | active | past_due | cancelled | expired
+  currentPeriodStart DateTime             @default(now())
+  currentPeriodEnd   DateTime
+  cancelAtPeriodEnd  Boolean              @default(false)
+  source             String               @default("b2c_online") // b2c_online | csr_grant | school_sponsored | manual_admin
+  autoRenew          Boolean              @default(true)
+  metadata           Json?
+  createdAt          DateTime             @default(now())
+  updatedAt          DateTime             @updatedAt
+  user               User                 @relation(fields: [studentId], references: [id], onDelete: Cascade)
+  planVersion        PlanVersion          @relation(fields: [planVersionId], references: [id])
+  payments           PaymentTransaction[]
+
+  @@index([studentId, status])
+}
+
+model Entitlement {
+  id                 String    @id @default(cuid())
+  studentId          String    @unique
+  source             String    @default("free") // paid | sponsored | free
+  effectiveAccess    String    @default("FREE") // FREE | PREMIUM_PAID | PREMIUM_SPONSORED
+  validFrom          DateTime  @default(now())
+  validTo            DateTime?
+  dailyTutorLimit    Int       @default(25)
+  voiceMinutesPerDay Int       @default(0)
+  battleEnabled      Boolean   @default(true)
+  createdAt          DateTime  @default(now())
+  updatedAt          DateTime  @updatedAt
+  user               User      @relation(fields: [studentId], references: [id], onDelete: Cascade)
+
+  @@index([studentId])
+}
+
+model PaymentTransaction {
+  id             String        @id @default(cuid())
+  code           String        @unique // TXN-000001
+  studentId      String
+  subscriptionId String?
+  amount         Decimal       @db.Decimal(10, 2)
+  currency       String        @default("BDT")
+  provider       String        @default("shurjopay") // shurjopay | bkash | nagad | manual
+  providerTxnId  String?       @unique
+  status         String        @default("pending") // pending | succeeded | failed | refunded
+  method         String?       // bkash | card | nagad | bank
+  metadata       Json?
+  initiatedAt    DateTime      @default(now())
+  completedAt    DateTime?
+  createdAt      DateTime      @default(now())
+  updatedAt      DateTime      @updatedAt
+  user           User          @relation(fields: [studentId], references: [id], onDelete: Cascade)
+  subscription   Subscription? @relation(fields: [subscriptionId], references: [id], onDelete: SetNull)
+  invoice        Invoice?
+
+  @@index([studentId, status])
+  @@index([provider, providerTxnId])
+}
+
+model PaymentWebhookEvent {
+  id          String    @id @default(cuid())
+  provider    String    // shurjopay | bkash
+  eventId     String?
+  eventType   String    @default("payment_notification")
+  payload     Json
+  signature   String?
+  processed   Boolean   @default(false)
+  processedAt DateTime?
+  createdAt   DateTime  @default(now())
+
+  @@index([provider, processed])
+}
+
+model Invoice {
+  id                   String             @id @default(cuid())
+  invoiceNumber        String             @unique // INV-YYYY-######
+  studentId            String
+  paymentTransactionId String             @unique
+  amount               Decimal            @db.Decimal(10, 2)
+  currency             String             @default("BDT")
+  status               String             @default("paid") // issued | paid | void
+  pdfPath              String?
+  issuedAt             DateTime           @default(now())
+  createdAt            DateTime           @default(now())
+  user                 User               @relation(fields: [studentId], references: [id], onDelete: Cascade)
+  paymentTransaction   PaymentTransaction @relation(fields: [paymentTransactionId], references: [id], onDelete: Cascade)
+
+  @@index([studentId])
+}
+
+model LedgerJournal {
+  id            String        @id @default(cuid())
+  code          String        @unique // JRN-000001
+  legalEntityId String?
+  entryType     String        // SUBSCRIPTION_PAYMENT | REFUND | CSR_GRANT
+  description   String
+  postedAt      DateTime      @default(now())
+  postedById    String?
+  createdAt     DateTime      @default(now())
+  entries       LedgerEntry[]
+
+  @@index([entryType, postedAt])
+}
+
+model LedgerEntry {
+  id          String        @id @default(cuid())
+  journalId   String
+  accountCode String        // 1000 Cash/Gateway, 4000 Subscription Revenue, 2000 Unearned Revenue
+  direction   String        // debit | credit
+  amount      Decimal       @db.Decimal(12, 2)
+  description String        @default("")
+  createdAt   DateTime      @default(now())
+  journal     LedgerJournal @relation(fields: [journalId], references: [id], onDelete: Cascade)
+
+  @@index([journalId])
+  @@index([accountCode])
+}
+
+// ── CSR & Foundation ──────────────────────────────────────────────────────────
+
+model Partner {
+  id                String   @id @default(cuid())
+  code              String   @unique // PRT-000001
+  name              String
+  type              String   // corporate | ngo | government | individual | other
+  contactName       String
+  contactEmail      String
+  contactPhone      String   @default("")
+  address           String   @default("")
+  reportingSchedule String   @default("quarterly") // monthly | quarterly | semi_annual | annual
+  donorRestrictions String   @default("")
+  status            String   @default("active") // active | archived
+  archivedAt        DateTime?
+  createdById       String?
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+  version           Int      @default(1)
+  agreements        GrantAgreement[]
+  programmes        Programme[]
+}
+
+model GrantAgreement {
+  id                        String    @id @default(cuid())
+  partnerId                 String
+  agreementRef              String    // external reference
+  versionNo                 Int
+  amountCommitted           Decimal   @db.Decimal(14, 2)
+  currency                  String    @default("BDT")
+  startDate                 DateTime  @db.Date
+  endDate                   DateTime  @db.Date
+  restrictions              String    @default("")
+  allowsInterEntityPurchase Boolean   @default(false)
+  signedOn                  DateTime? @db.Date
+  documentFileId            String?
+  status                    String    @default("draft") // draft | pending_approval | active | superseded | closed
+  approvalId                String?
+  supersedesId              String?
+  createdById               String?
+  createdAt                 DateTime  @default(now())
+  partner                   Partner   @relation(fields: [partnerId], references: [id])
+
+  @@unique([agreementRef, versionNo])
+}
+
+model Programme {
+  id                     String         @id @default(cuid())
+  code                   String         @unique // PRG-000001
+  name                   String
+  partnerId              String
+  agreementRef           String
+  legalEntityId          String         @default("foundation")
+  grantAmount            Decimal        @db.Decimal(14, 2)
+  currency               String         @default("BDT")
+  startDate              DateTime       @db.Date
+  endDate                DateTime       @db.Date
+  divisions              String[]       @default([])
+  districts              String[]       @default([])
+  upazilas               String[]       @default([])
+  eligibleGrades         Int[]          @default([])
+  eligibleSchoolIds      String[]       @default([])
+  eligibilityNotes       String         @default("")
+  seatCapacity           Int
+  fundedRatePerSeatMonth Decimal        @db.Decimal(14, 2)
+  status                 String         @default("draft") // draft | pending_approval | active | suspended | completed | closed
+  approvalId             String?
+  createdById            String?
+  createdAt              DateTime       @default(now())
+  updatedAt              DateTime       @updatedAt
+  version                Int            @default(1)
+  partner                Partner        @relation(fields: [partnerId], references: [id])
+  budgetLines            BudgetLine[]
+  milestones             Milestone[]
+  targets                ImpactTarget[]
+  beneficiaries          Beneficiary[]
+  receipts               GrantReceipt[]
+  interEntityRequests    InterEntityRequest[]
+
+  @@index([partnerId, status])
+}
+
+model BudgetLine {
+  id          String    @id @default(cuid())
+  programmeId String
+  category    String    // student_access | teacher_training | devices | events | operations | monitoring | other
+  description String    @default("")
+  amount      Decimal   @db.Decimal(14, 2)
+  createdAt   DateTime  @default(now())
+  programme   Programme @relation(fields: [programmeId], references: [id], onDelete: Cascade)
+
+  @@unique([programmeId, category])
+}
+
+model Milestone {
+  id              String    @id @default(cuid())
+  programmeId     String
+  title           String
+  dueDate         DateTime  @db.Date
+  status          String    @default("pending") // pending | achieved | missed | waived
+  achievedOn      DateTime? @db.Date
+  evidenceFileIds String[]  @default([])
+  programme       Programme @relation(fields: [programmeId], references: [id], onDelete: Cascade)
+}
+
+model ImpactTarget {
+  id          String    @id @default(cuid())
+  programmeId String
+  metricKey   String    // csr.reach | csr.active_beneficiaries | csr.teachers_trained | csr.schools_reached | csr.assessment_avg
+  targetValue Decimal   @db.Decimal(14, 2)
+  baseline    Decimal?  @db.Decimal(14, 2)
+  dueDate     DateTime  @db.Date
+  programme   Programme @relation(fields: [programmeId], references: [id], onDelete: Cascade)
+
+  @@unique([programmeId, metricKey])
+}
+
+model GrantReceipt {
+  id              String    @id @default(cuid())
+  code            String    @unique // GRC-000001
+  programmeId     String
+  amount          Decimal   @db.Decimal(14, 2)
+  receivedOn      DateTime  @db.Date
+  reference       String    // bank reference
+  evidenceFileIds String[]  @default([])
+  journalId       String?
+  idempotencyKey  String    @unique
+  recordedById    String
+  createdAt       DateTime  @default(now())
+  programme       Programme @relation(fields: [programmeId], references: [id])
+}
+
+model Beneficiary {
+  id               String        @id @default(cuid())
+  programmeId      String
+  studentId        String
+  eligibilityState String        @default("pending") // pending | eligible | ineligible
+  ineligibleReason String?
+  verifiedAt       DateTime?
+  verifiedById     String?
+  status           String        @default("active") // active | removed
+  createdAt        DateTime      @default(now())
+  updatedAt        DateTime      @updatedAt
+  programme        Programme     @relation(fields: [programmeId], references: [id])
+  student          User          @relation(fields: [studentId], references: [id])
+  sponsorships     Sponsorship[]
+
+  @@unique([programmeId, studentId])
+}
+
+model Sponsorship {
+  id              String      @id @default(cuid())
+  code            String      @unique // SPN-000001
+  beneficiaryId   String
+  programmeId     String
+  studentId       String
+  coverageFrom    DateTime    @db.Date
+  coverageTo      DateTime    @db.Date
+  fundedRate      Decimal     @db.Decimal(14, 2)
+  allocatedAmount Decimal     @db.Decimal(14, 2)
+  status          String      @default("active") // active | revoked | expired
+  revokedAt       DateTime?
+  revokedReason   String?
+  entitlementId   String?
+  idempotencyKey  String      @unique
+  createdById     String
+  createdAt       DateTime    @default(now())
+  beneficiary     Beneficiary @relation(fields: [beneficiaryId], references: [id])
+
+  @@index([studentId, status, coverageFrom, coverageTo])
+  @@index([programmeId, status])
+}
+
+model InterEntityRequest {
+  id                    String    @id @default(cuid())
+  code                  String    @unique // IER-000001
+  programmeId           String
+  description           String
+  amount                Decimal   @db.Decimal(14, 2)
+  costRationale         String
+  conflictDisclosure    String
+  foundationPurchaseRef String
+  ltdQuotationRef       String?
+  ltdInvoiceId          String?
+  contractRef           String?
+  donorPermissionRef    String?
+  attachmentFileIds     String[]  @default([])
+  status                String    @default("draft") // draft | submitted | foundation_approved | donor_permission_recorded | approved | invoiced | paid | rejected | cancelled
+  approvalIds           String[]  @default([])
+  paidJournalId         String?
+  createdById           String
+  createdAt             DateTime  @default(now())
+  updatedAt             DateTime  @updatedAt
+  version               Int       @default(1)
+  programme             Programme @relation(fields: [programmeId], references: [id])
+
+  @@index([programmeId, status])
+}
+
+// ── LMS Extensions (Sprint 3 / Phase 4) ──────────────────────────
+
+model LessonMaterial {
+  id        String   @id @default(cuid())
+  lessonId  String
+  title     String
+  fileType  String   // pdf | slide | doc | worksheet
+  fileUrl   String
+  fileSize  Int      @default(0)
+  createdAt DateTime @default(now())
+  lesson    Lesson   @relation(fields: [lessonId], references: [id], onDelete: Cascade)
+
+  @@index([lessonId])
+}
+
+model Curriculum {
+  id          String   @id @default(cuid())
+  code        String   @unique // CUR-2026-01
+  name        String
+  grade       Int
+  description String   @default("")
+  status      String   @default("active") // active | draft | archived
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}
+
+model Enrolment {
+  id              String    @id @default(cuid())
+  studentId       String
+  courseId        String
+  status          String    @default("active") // active | completed | dropped
+  progressPct     Int       @default(0)
+  activeWatchSec  Int       @default(0)
+  completedAt     DateTime?
+  certificateCode String?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+  user            User      @relation(fields: [studentId], references: [id], onDelete: Cascade)
+  course          Course    @relation(fields: [courseId], references: [id], onDelete: Cascade)
+
+  @@unique([studentId, courseId])
+  @@index([studentId, status])
+}
+
+model ContentReview {
+  id            String    @id @default(cuid())
+  targetType    String    // COURSE | LESSON
+  targetId      String
+  version       Int       @default(1)
+  status        String    @default("pending") // pending | approved | rejected
+  submittedById String
+  reviewerId    String?
+  reviewNotes   String?
+  diffSummary   Json?
+  reviewedAt    DateTime?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  @@index([targetType, targetId])
+  @@index([status])
+}
+
+// ── Billing, Payments & Entitlements (Sprint 3 / Phase 4) ────────
+
+model Plan {
+  id          String        @id @default(cuid())
+  code        String        @unique // PLN-000001
+  name        String
+  description String        @default("")
+  accessType  String        @default("FREE") // FREE | PREMIUM_PAID | PREMIUM_SPONSORED
+  status      String        @default("active") // active | draft | archived
+  createdAt   DateTime      @default(now())
+  updatedAt   DateTime      @updatedAt
+  versions    PlanVersion[]
+}
+
+model PlanVersion {
+  id                 String         @id @default(cuid())
+  planId             String
+  versionNumber      Int            @default(1)
+  priceAmount        Decimal        @db.Decimal(10, 2)
+  currency           String         @default("BDT")
+  billingInterval    String         @default("month") // month | year | one_time
+  trialDays          Int            @default(0)
+  quotas             Json           // { dailyTutorLimit: 100, voiceMinutesPerDay: 30, battleEnabled: true }
+  status             String         @default("active") // draft | active | archived
+  effectiveFrom      DateTime       @default(now())
+  effectiveTo        DateTime?
+  createdAt          DateTime       @default(now())
+  updatedAt          DateTime       @updatedAt
+  plan               Plan           @relation(fields: [planId], references: [id], onDelete: Cascade)
+  subscriptions      Subscription[]
+
+  @@unique([planId, versionNumber])
+}
+
+model Subscription {
+  id                 String               @id @default(cuid())
+  code               String               @unique // SUB-000001
+  studentId          String
+  planVersionId      String
+  status             String               @default("active") // trialing | active | past_due | cancelled | expired
+  currentPeriodStart DateTime             @default(now())
+  currentPeriodEnd   DateTime
+  cancelAtPeriodEnd  Boolean              @default(false)
+  source             String               @default("b2c_online") // b2c_online | csr_grant | school_sponsored | manual_admin
+  autoRenew          Boolean              @default(true)
+  metadata           Json?
+  createdAt          DateTime             @default(now())
+  updatedAt          DateTime             @updatedAt
+  user               User                 @relation(fields: [studentId], references: [id], onDelete: Cascade)
+  planVersion        PlanVersion          @relation(fields: [planVersionId], references: [id])
+  payments           PaymentTransaction[]
+
+  @@index([studentId, status])
+}
+
+model Entitlement {
+  id                 String    @id @default(cuid())
+  studentId          String    @unique
+  source             String    @default("free") // paid | sponsored | free
+  effectiveAccess    String    @default("FREE") // FREE | PREMIUM_PAID | PREMIUM_SPONSORED
+  validFrom          DateTime  @default(now())
+  validTo            DateTime?
+  dailyTutorLimit    Int       @default(25)
+  voiceMinutesPerDay Int       @default(0)
+  battleEnabled      Boolean   @default(true)
+  createdAt          DateTime  @default(now())
+  updatedAt          DateTime  @updatedAt
+  user               User      @relation(fields: [studentId], references: [id], onDelete: Cascade)
+
+  @@index([studentId])
+}
+
+model PaymentTransaction {
+  id             String        @id @default(cuid())
+  code           String        @unique // TXN-000001
+  studentId      String
+  subscriptionId String?
+  amount         Decimal       @db.Decimal(10, 2)
+  currency       String        @default("BDT")
+  provider       String        @default("shurjopay") // shurjopay | bkash | nagad | manual
+  providerTxnId  String?       @unique
+  status         String        @default("pending") // pending | succeeded | failed | refunded
+  method         String?       // bkash | card | nagad | bank
+  metadata       Json?
+  initiatedAt    DateTime      @default(now())
+  completedAt    DateTime?
+  createdAt      DateTime      @default(now())
+  updatedAt      DateTime      @updatedAt
+  user           User          @relation(fields: [studentId], references: [id], onDelete: Cascade)
+  subscription   Subscription? @relation(fields: [subscriptionId], references: [id], onDelete: SetNull)
+  invoice        Invoice?
+
+  @@index([studentId, status])
+  @@index([provider, providerTxnId])
+}
+
+model PaymentWebhookEvent {
+  id          String    @id @default(cuid())
+  provider    String    // shurjopay | bkash
+  eventId     String?
+  eventType   String    @default("payment_notification")
+  payload     Json
+  signature   String?
+  processed   Boolean   @default(false)
+  processedAt DateTime?
+  createdAt   DateTime  @default(now())
+
+  @@index([provider, processed])
+}
+
+model Invoice {
+  id                   String             @id @default(cuid())
+  invoiceNumber        String             @unique // INV-YYYY-######
+  studentId            String
+  paymentTransactionId String             @unique
+  amount               Decimal            @db.Decimal(10, 2)
+  currency             String             @default("BDT")
+  status               String             @default("paid") // issued | paid | void
+  pdfPath              String?
+  issuedAt             DateTime           @default(now())
+  createdAt            DateTime           @default(now())
+  user                 User               @relation(fields: [studentId], references: [id], onDelete: Cascade)
+  paymentTransaction   PaymentTransaction @relation(fields: [paymentTransactionId], references: [id], onDelete: Cascade)
+
+  @@index([studentId])
+}
+
+model LedgerJournal {
+  id            String        @id @default(cuid())
+  code          String        @unique // JRN-000001
+  legalEntityId String?
+  entryType     String        // SUBSCRIPTION_PAYMENT | REFUND | CSR_GRANT
+  description   String
+  postedAt      DateTime      @default(now())
+  postedById    String?
+  createdAt     DateTime      @default(now())
+  entries       LedgerEntry[]
+
+  @@index([entryType, postedAt])
+}
+
+model LedgerEntry {
+  id          String        @id @default(cuid())
+  journalId   String
+  accountCode String        // 1000 Cash/Gateway, 4000 Subscription Revenue, 2000 Unearned Revenue
+  direction   String        // debit | credit
+  amount      Decimal       @db.Decimal(12, 2)
+  description String        @default("")
+  createdAt   DateTime      @default(now())
+  journal     LedgerJournal @relation(fields: [journalId], references: [id], onDelete: Cascade)
+
+  @@index([journalId])
+  @@index([accountCode])
+}
+
+// ── CSR & Foundation ──────────────────────────────────────────────────────────
+
+model Partner {
+  id                String   @id @default(cuid())
+  code              String   @unique // PRT-000001
+  name              String
+  type              String   // corporate | ngo | government | individual | other
+  contactName       String
+  contactEmail      String
+  contactPhone      String   @default("")
+  address           String   @default("")
+  reportingSchedule String   @default("quarterly") // monthly | quarterly | semi_annual | annual
+  donorRestrictions String   @default("")
+  status            String   @default("active") // active | archived
+  archivedAt        DateTime?
+  createdById       String?
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+  version           Int      @default(1)
+  agreements        GrantAgreement[]
+  programmes        Programme[]
+}
+
+model GrantAgreement {
+  id                        String    @id @default(cuid())
+  partnerId                 String
+  agreementRef              String    // external reference
+  versionNo                 Int
+  amountCommitted           Decimal   @db.Decimal(14, 2)
+  currency                  String    @default("BDT")
+  startDate                 DateTime  @db.Date
+  endDate                   DateTime  @db.Date
+  restrictions              String    @default("")
+  allowsInterEntityPurchase Boolean   @default(false)
+  signedOn                  DateTime? @db.Date
+  documentFileId            String?
+  status                    String    @default("draft") // draft | pending_approval | active | superseded | closed
+  approvalId                String?
+  supersedesId              String?
+  createdById               String?
+  createdAt                 DateTime  @default(now())
+  partner                   Partner   @relation(fields: [partnerId], references: [id])
+
+  @@unique([agreementRef, versionNo])
+}
+
+model Programme {
+  id                     String         @id @default(cuid())
+  code                   String         @unique // PRG-000001
+  name                   String
+  partnerId              String
+  agreementRef           String
+  legalEntityId          String         @default("foundation")
+  grantAmount            Decimal        @db.Decimal(14, 2)
+  currency               String         @default("BDT")
+  startDate              DateTime       @db.Date
+  endDate                DateTime       @db.Date
+  divisions              String[]       @default([])
+  districts              String[]       @default([])
+  upazilas               String[]       @default([])
+  eligibleGrades         Int[]          @default([])
+  eligibleSchoolIds      String[]       @default([])
+  eligibilityNotes       String         @default("")
+  seatCapacity           Int
+  fundedRatePerSeatMonth Decimal        @db.Decimal(14, 2)
+  status                 String         @default("draft") // draft | pending_approval | active | suspended | completed | closed
+  approvalId             String?
+  createdById            String?
+  createdAt              DateTime       @default(now())
+  updatedAt              DateTime       @updatedAt
+  version                Int            @default(1)
+  partner                Partner        @relation(fields: [partnerId], references: [id])
+  budgetLines            BudgetLine[]
+  milestones             Milestone[]
+  targets                ImpactTarget[]
+  beneficiaries          Beneficiary[]
+  receipts               GrantReceipt[]
+  interEntityRequests    InterEntityRequest[]
+
+  @@index([partnerId, status])
+}
+
+model BudgetLine {
+  id          String    @id @default(cuid())
+  programmeId String
+  category    String    // student_access | teacher_training | devices | events | operations | monitoring | other
+  description String    @default("")
+  amount      Decimal   @db.Decimal(14, 2)
+  createdAt   DateTime  @default(now())
+  programme   Programme @relation(fields: [programmeId], references: [id], onDelete: Cascade)
+
+  @@unique([programmeId, category])
+}
+
+model Milestone {
+  id              String    @id @default(cuid())
+  programmeId     String
+  title           String
+  dueDate         DateTime  @db.Date
+  status          String    @default("pending") // pending | achieved | missed | waived
+  achievedOn      DateTime? @db.Date
+  evidenceFileIds String[]  @default([])
+  programme       Programme @relation(fields: [programmeId], references: [id], onDelete: Cascade)
+}
+
+model ImpactTarget {
+  id          String    @id @default(cuid())
+  programmeId String
+  metricKey   String    // csr.reach | csr.active_beneficiaries | csr.teachers_trained | csr.schools_reached | csr.assessment_avg
+  targetValue Decimal   @db.Decimal(14, 2)
+  baseline    Decimal?  @db.Decimal(14, 2)
+  dueDate     DateTime  @db.Date
+  programme   Programme @relation(fields: [programmeId], references: [id], onDelete: Cascade)
+
+  @@unique([programmeId, metricKey])
+}
+
+model GrantReceipt {
+  id              String    @id @default(cuid())
+  code            String    @unique // GRC-000001
+  programmeId     String
+  amount          Decimal   @db.Decimal(14, 2)
+  receivedOn      DateTime  @db.Date
+  reference       String    // bank reference
+  evidenceFileIds String[]  @default([])
+  journalId       String?
+  idempotencyKey  String    @unique
+  recordedById    String
+  createdAt       DateTime  @default(now())
+  programme       Programme @relation(fields: [programmeId], references: [id])
+}
+
+model Beneficiary {
+  id               String        @id @default(cuid())
+  programmeId      String
+  studentId        String
+  eligibilityState String        @default("pending") // pending | eligible | ineligible
+  ineligibleReason String?
+  verifiedAt       DateTime?
+  verifiedById     String?
+  status           String        @default("active") // active | removed
+  createdAt        DateTime      @default(now())
+  updatedAt        DateTime      @updatedAt
+  programme        Programme     @relation(fields: [programmeId], references: [id])
+  student          User          @relation(fields: [studentId], references: [id])
+  sponsorships     Sponsorship[]
+
+  @@unique([programmeId, studentId])
+}
+
+model Sponsorship {
+  id              String      @id @default(cuid())
+  code            String      @unique // SPN-000001
+  beneficiaryId   String
+  programmeId     String
+  studentId       String
+  coverageFrom    DateTime    @db.Date
+  coverageTo      DateTime    @db.Date
+  fundedRate      Decimal     @db.Decimal(14, 2)
+  allocatedAmount Decimal     @db.Decimal(14, 2)
+  status          String      @default("active") // active | revoked | expired
+  revokedAt       DateTime?
+  revokedReason   String?
+  entitlementId   String?
+  idempotencyKey  String      @unique
+  createdById     String
+  createdAt       DateTime    @default(now())
+  beneficiary     Beneficiary @relation(fields: [beneficiaryId], references: [id])
+
+  @@index([studentId, status, coverageFrom, coverageTo])
+  @@index([programmeId, status])
+}
+
+model InterEntityRequest {
+  id                    String    @id @default(cuid())
+  code                  String    @unique // IER-000001
+  programmeId           String
+  description           String
+  amount                Decimal   @db.Decimal(14, 2)
+  costRationale         String
+  conflictDisclosure    String
+  foundationPurchaseRef String
+  ltdQuotationRef       String?
+  ltdInvoiceId          String?
+  contractRef           String?
+  donorPermissionRef    String?
+  attachmentFileIds     String[]  @default([])
+  status                String    @default("draft") // draft | submitted | foundation_approved | donor_permission_recorded | approved | invoiced | paid | rejected | cancelled
+  approvalIds           String[]  @default([])
+  paidJournalId         String?
+  createdById           String
+  createdAt             DateTime  @default(now())
+  updatedAt             DateTime  @updatedAt
+  version               Int       @default(1)
+  programme             Programme @relation(fields: [programmeId], references: [id])
+
+  @@index([programmeId, status])
 }

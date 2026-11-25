@@ -8,9 +8,9 @@ import { prisma } from "../../lib/prisma";
 export async function loadCourseTree(courseId: string, userId: string) {
   const [course, chapters, lessons, progress] = await Promise.all([
     prisma.course.findUnique({ where: { id: courseId }, include: { subject: true } }),
-    prisma.chapter.findMany({ where: { courseId }, orderBy: { number: "asc" } }),
+    prisma.chapter.findMany({ where: { courseId, status: { not: "draft" } }, orderBy: { number: "asc" } }),
     prisma.lesson.findMany({
-      where: { unit: { courseId } },
+      where: { unit: { courseId }, status: { not: "draft" } },
       orderBy: { order: "asc" },
       select: { id: true, title: true, chapterId: true, durationSec: true, readingMin: true, xpReward: true, checkpoints: true, body: true },
     }),
