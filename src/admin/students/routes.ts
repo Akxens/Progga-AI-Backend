@@ -17,7 +17,7 @@ export const studentsRouter = Router();
 studentsRouter.get("/", requirePermission("students.view"), async (req, res, next) => {
   try {
     const ctx = getCtx(req);
-    const q = typeof req.query.q === "string" ? req.query.q.trim() : "";
+    const q = (typeof req.query.q === "string" ? req.query.q : typeof req.query.search === "string" ? req.query.search : "").trim();
     const page = Math.max(1, Number(req.query.page) || 1);
     const pageSize = Math.min(100, Math.max(1, Number(req.query.pageSize) || 25));
 
