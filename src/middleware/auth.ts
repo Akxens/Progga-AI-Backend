@@ -9,18 +9,30 @@ export const AUTH_COOKIE = "progga_token";
 export const GUARDIAN_COOKIE = "progga_guardian";
 export const revokedSettingKey = (userId: string) => `auth.revoked:${userId}`;
 
-export function getCookieOptions() {
-  const isSecure = env.isProd;
+export function getCookieOptions(res?: Response) {
+  const req: any = res ? (res as any).req : undefined;
+  const isHttps =
+    env.isProd ||
+    Boolean(
+      req && (
+        req.secure ||
+        req.get?.("x-forwarded-proto") === "https" ||
+        req.get?.("origin")?.startsWith("https://") ||
+        req.headers?.["x-forwarded-proto"] === "https" ||
+        (typeof req.headers?.origin === "string" && req.headers.origin.startsWith("https://"))
+      ),
+    );
+
   return {
     httpOnly: true,
-    sameSite: (isSecure ? "none" : "lax") as "none" | "lax",
-    secure: isSecure,
+    sameSite: (isHttps ? "none" : "lax") as "none" | "lax",
+    secure: isHttps,
     path: "/",
   };
 }
 
 export function setSessionCookie(res: Response, name: string, token: string) {
-  const opts = getCookieOptions();
+  const opts = getCookieOptions(res);
   res.cookie(name, token, {
     ...opts,
     maxAge: 7 * 24 * 60 * 60 * 1000,
@@ -28,7 +40,7 @@ export function setSessionCookie(res: Response, name: string, token: string) {
 }
 
 export function clearSessionCookie(res: Response, name: string) {
-  const opts = getCookieOptions();
+  const opts = getCookieOptions(res);
   res.clearCookie(name, {
     httpOnly: opts.httpOnly,
     sameSite: opts.sameSite,

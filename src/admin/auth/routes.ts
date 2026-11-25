@@ -270,7 +270,7 @@ adminAuthRouter.post("/mfa/enable", requireAuth, async (req, res, next) => {
       expiresIn: "12h",
     });
     res.cookie(ADMIN_MFA_COOKIE, mfaToken, {
-      ...getCookieOptions(),
+      ...getCookieOptions(res),
       maxAge: 12 * 60 * 60 * 1000,
     });
 
@@ -343,7 +343,7 @@ adminAuthRouter.post("/mfa/verify", requireAuth, mfaLimiter, async (req, res, ne
       expiresIn: "12h",
     });
     res.cookie(ADMIN_MFA_COOKIE, mfaToken, {
-      ...getCookieOptions(),
+      ...getCookieOptions(res),
       maxAge: 12 * 60 * 60 * 1000,
     });
 
