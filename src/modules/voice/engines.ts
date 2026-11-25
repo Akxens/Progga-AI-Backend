@@ -1,4 +1,5 @@
 import { z } from "zod";
+import WebSocket from "ws";
 import { env } from "../../config/env";
 import { HttpError } from "../../lib/errors";
 import { logger } from "../../lib/logger";
@@ -458,14 +459,22 @@ function openaiRealtimeSpeech(text: string, lang: SpeechLang, voice: string, sig
 }
 
 async function openaiSpeech(text: string, lang: SpeechLang, voice: string, signal?: AbortSignal): Promise<SpeechAudio> {
-  if (env.OPENAI_TTS_MODEL.includes("realtime")) return openaiRealtimeSpeech(text, lang, voice, signal);
+  if (env.OPENAI_TTS_MODEL.includes("realtime")) {
+    try {
+      return await openaiRealtimeSpeech(text, lang, voice, signal);
+    } catch (err) {
+      if (signal?.aborted) throw err;
+      logger.warn({ err }, "OpenAI realtime speech failed, falling back to /audio/speech");
+    }
+  }
+  const model = env.OPENAI_TTS_MODEL.includes("realtime") ? "tts-1" : env.OPENAI_TTS_MODEL;
   const res = await call(
     "OpenAI",
     `${env.OPENAI_BASE_URL}/audio/speech`,
     {
       method: "POST",
       headers: { Authorization: `Bearer ${env.OPENAI_API_KEY}`, "Content-Type": "application/json" },
-      body: JSON.stringify({ model: env.OPENAI_TTS_MODEL, voice, input: text, instructions: kidDirections(lang), response_format: "mp3" }),
+      body: JSON.stringify({ model, voice: REALTIME_VOICES.has(voice) ? voice : "coral", input: text, instructions: kidDirections(lang), response_format: "mp3" }),
     },
     30_000,
     signal,
