@@ -54,8 +54,42 @@ dashboardRouter.get("/", requirePermission("dashboard.executive.view"), async (r
     // Calculate MRR
     const mrr = activeSubscriptions.reduce(
       (sum, s) => sum + Number(s.planVersion?.priceAmount || 0),
-      0
+      0,
     );
+
+    const days = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+    const now = new Date();
+    const last7Days = Array.from({ length: 7 }, (_, i) => {
+      const d = new Date(now);
+      d.setDate(d.getDate() - (6 - i));
+      d.setHours(0, 0, 0, 0);
+      const nextD = new Date(d);
+      nextD.setDate(nextD.getDate() + 1);
+      return {
+        label: days[d.getDay()],
+        start: d,
+        end: nextD,
+      };
+    });
+
+    const [weeklySessions, weeklyActiveUsers] = await Promise.all([
+      Promise.all(
+        last7Days.map(async (day) => {
+          const count = await prisma.tutorSession.count({
+            where: { createdAt: { gte: day.start, lt: day.end } },
+          });
+          return { x: day.label, y: count };
+        }),
+      ),
+      Promise.all(
+        last7Days.map(async (day) => {
+          const count = await prisma.user.count({
+            where: { role: "STUDENT", lastSeenAt: { gte: day.start, lt: day.end } },
+          });
+          return { x: day.label, y: count };
+        }),
+      ),
+    ]);
 
     sendOne(res, {
       kpis: {
@@ -69,6 +103,10 @@ dashboardRouter.get("/", requirePermission("dashboard.executive.view"), async (r
         schoolsCount,
         teachersCount,
         pendingActionsCount: pendingApprovalsCount + pendingReviewsCount,
+      },
+      trends: {
+        weeklySessions,
+        weeklyActiveUsers,
       },
       recentActivity: recentAudits.map((a) => ({
         id: a.id,
