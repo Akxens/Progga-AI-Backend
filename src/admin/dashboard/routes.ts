@@ -26,6 +26,8 @@ dashboardRouter.get("/", requirePermission("dashboard.executive.view"), async (r
       pendingApprovalsCount,
       pendingReviewsCount,
       recentAudits,
+      recentChats,
+      chatsBySubject,
     ] = await Promise.all([
       prisma.user.count({ where: { role: "STUDENT" } }),
       prisma.user.count({
@@ -48,6 +50,25 @@ dashboardRouter.get("/", requirePermission("dashboard.executive.view"), async (r
       prisma.auditLog.findMany({
         orderBy: { createdAt: "desc" },
         take: 8,
+      }),
+      prisma.tutorSession.findMany({
+        orderBy: { createdAt: "desc" },
+        take: 6,
+        select: {
+          id: true,
+          title: true,
+          subject: true,
+          mode: true,
+          status: true,
+          createdAt: true,
+          student: { select: { id: true, name: true, grade: true } },
+        },
+      }),
+      prisma.tutorSession.groupBy({
+        by: ["subject"],
+        _count: { id: true },
+        orderBy: { _count: { id: "desc" } },
+        take: 5,
       }),
     ]);
 
@@ -115,6 +136,20 @@ dashboardRouter.get("/", requirePermission("dashboard.executive.view"), async (r
         entityId: a.entityId,
         actorUserId: a.actorUserId || "System",
         timestamp: a.createdAt,
+      })),
+      recentChats: recentChats.map((c) => ({
+        id: c.id,
+        title: c.title,
+        subject: c.subject,
+        mode: c.mode,
+        status: c.status,
+        studentName: c.student?.name || "Student",
+        grade: c.student?.grade,
+        createdAt: c.createdAt,
+      })),
+      chatsBySubject: chatsBySubject.map((s) => ({
+        subject: s.subject,
+        count: s._count.id,
       })),
     });
   } catch (err) {
