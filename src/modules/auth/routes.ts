@@ -8,7 +8,7 @@ import { env } from "../../config/env";
 import { prisma } from "../../lib/prisma";
 import { parseContact, type Contact } from "../../lib/contact";
 import { badRequest, conflict, HttpError, unauthorized } from "../../lib/errors";
-import { AUTH_COOKIE, GUARDIAN_COOKIE, authed, requireAuth, requireFreshSession, revokedSettingKey, setSessionCookie, signToken, verifyToken, type Role } from "../../middleware/auth";
+import { AUTH_COOKIE, GUARDIAN_COOKIE, authed, clearSessionCookie, requireAuth, requireFreshSession, revokedSettingKey, setSessionCookie, signToken, verifyToken, type Role } from "../../middleware/auth";
 import { publicUser } from "../users/presenter";
 import { Birthdate } from "../users/profile";
 import { nextCode } from "../../admin/core/codes";
@@ -206,8 +206,9 @@ authRouter.post("/signup", signupLimiter, async (req, res) => {
     }
   }
 
-  setSessionCookie(res, AUTH_COOKIE, signToken({ id: user!.id, role: user!.role as Role }));
-  res.status(201).json({ user: publicUser(user!) });
+  const token = signToken({ id: user!.id, role: user!.role as Role });
+  setSessionCookie(res, AUTH_COOKIE, token);
+  res.status(201).json({ user: publicUser(user!), token });
 });
 
 authRouter.post("/login", loginLimiter, async (req, res) => {
@@ -222,14 +223,15 @@ authRouter.post("/login", loginLimiter, async (req, res) => {
   if (user.accountStatus === "closed") {
     throw new HttpError(403, "Your account is closed.", "account_closed");
   }
-  res.clearCookie(GUARDIAN_COOKIE, { path: "/" });
-  setSessionCookie(res, AUTH_COOKIE, signToken({ id: user.id, role: user.role as Role }));
-  res.json({ user: publicUser(user) });
+  clearSessionCookie(res, GUARDIAN_COOKIE);
+  const token = signToken({ id: user.id, role: user.role as Role });
+  setSessionCookie(res, AUTH_COOKIE, token);
+  res.json({ user: publicUser(user), token });
 });
 
 authRouter.post("/logout", (_req, res) => {
-  res.clearCookie(AUTH_COOKIE, { path: "/" });
-  res.clearCookie(GUARDIAN_COOKIE, { path: "/" });
+  clearSessionCookie(res, AUTH_COOKIE);
+  clearSessionCookie(res, GUARDIAN_COOKIE);
   res.json({ ok: true });
 });
 
@@ -247,11 +249,12 @@ authRouter.post("/switch-back", requireAuth, requireFreshSession, async (req, re
   const parked = verifyToken(req.cookies?.[GUARDIAN_COOKIE]);
   const kidId = authed(req).id;
   const link = parked && (await prisma.guardianLink.findUnique({ where: { guardianId_studentId: { guardianId: parked.id, studentId: kidId } } }));
-  res.clearCookie(GUARDIAN_COOKIE, { path: "/" });
+  clearSessionCookie(res, GUARDIAN_COOKIE);
   if (!parked || !link || link.status !== "active") throw unauthorized("Please log in to your parent account");
   const guardian = await prisma.user.findUniqueOrThrow({ where: { id: parked.id } });
-  setSessionCookie(res, AUTH_COOKIE, signToken({ id: guardian.id, role: guardian.role as Role }));
-  res.json({ user: publicUser(guardian) });
+  const token = signToken({ id: guardian.id, role: guardian.role as Role });
+  setSessionCookie(res, AUTH_COOKIE, token);
+  res.json({ user: publicUser(guardian), token });
 });
 
 const PasswordBody = z.object({ currentPassword: z.string().min(1), newPassword: z.string().min(8).max(100) });

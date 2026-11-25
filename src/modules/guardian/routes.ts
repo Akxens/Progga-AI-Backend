@@ -104,9 +104,10 @@ guardianRouter.post("/students/:id/switch", async (req, res) => {
   const studentId = parseId(req.params.id);
   await assertLinked(me.id, studentId);
   const student = await prisma.user.findUniqueOrThrow({ where: { id: studentId } });
+  const studentToken = signToken({ id: student.id, role: "STUDENT", delegatedBy: me.id });
   setSessionCookie(res, GUARDIAN_COOKIE, signToken(me));
-  setSessionCookie(res, AUTH_COOKIE, signToken({ id: student.id, role: "STUDENT", delegatedBy: me.id }));
-  res.json({ user: publicUser(student) });
+  setSessionCookie(res, AUTH_COOKIE, studentToken);
+  res.json({ user: publicUser(student), token: studentToken });
 });
 
 guardianRouter.delete("/students/:id", async (req, res) => {

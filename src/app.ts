@@ -7,7 +7,7 @@ import cookieParser from "cookie-parser";
 import rateLimit from "express-rate-limit";
 import { env } from "./config/env";
 import { errorHandler, notFoundHandler } from "./middleware/error";
-import { requireOrigin } from "./middleware/auth";
+import { isAllowedOrigin, requireOrigin } from "./middleware/auth";
 import { authRouter } from "./modules/auth/routes";
 import { photosRouter, usersRouter } from "./modules/users/routes";
 import { subjectsRouter } from "./modules/subjects/routes";
@@ -46,7 +46,20 @@ export function createApp() {
     runWithReqId(reqId, next);
   });
   app.use(helmet());
-  app.use(cors({ origin: env.corsOrigins, credentials: true }));
+  app.use(
+    cors({
+      origin: (requestOrigin, callback) => {
+        if (!requestOrigin) return callback(null, true);
+        if (isAllowedOrigin(requestOrigin, env.corsOrigins)) {
+          return callback(null, true);
+        }
+        callback(null, false);
+      },
+      credentials: true,
+      methods: ["GET", "HEAD", "PUT", "PATCH", "POST", "DELETE", "OPTIONS"],
+      allowedHeaders: ["Content-Type", "Authorization", "X-Workspace", "Idempotency-Key", "X-Request-Id"],
+    }),
+  );
   app.use(express.json({ limit: "100kb" }));
   app.use(cookieParser());
   app.use(requireOrigin(env.corsOrigins));

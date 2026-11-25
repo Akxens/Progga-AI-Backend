@@ -10,7 +10,7 @@ import { env } from "../../config/env";
 import { prisma } from "../../lib/prisma";
 import { badRequest, unauthorized } from "../../lib/errors";
 import { encrypt, decrypt } from "../../lib/crypto";
-import { AUTH_COOKIE, requireAuth, revokedSettingKey, setSessionCookie, signToken, type Role } from "../../middleware/auth";
+import { AUTH_COOKIE, clearSessionCookie, getCookieOptions, requireAuth, revokedSettingKey, setSessionCookie, signToken, type Role } from "../../middleware/auth";
 import { ADMIN_MFA_COOKIE } from "../core/require-admin";
 import { sendOne } from "../core/respond";
 
@@ -159,8 +159,9 @@ adminAuthRouter.post("/password", requireAuth, async (req, res, next) => {
       });
     });
 
-    setSessionCookie(res, AUTH_COOKIE, signToken({ id: user.id, role: user.role as Role }));
-    return sendOne(res, { ok: true });
+    const token = signToken({ id: user.id, role: user.role as Role });
+    setSessionCookie(res, AUTH_COOKIE, token);
+    return sendOne(res, { ok: true, token });
   } catch (err) {
     return next(err);
   }
@@ -269,11 +270,8 @@ adminAuthRouter.post("/mfa/enable", requireAuth, async (req, res, next) => {
       expiresIn: "12h",
     });
     res.cookie(ADMIN_MFA_COOKIE, mfaToken, {
-      httpOnly: true,
-      sameSite: "lax",
-      secure: env.isProd,
+      ...getCookieOptions(),
       maxAge: 12 * 60 * 60 * 1000,
-      path: "/",
     });
 
     return sendOne(res, { recoveryCodes });
@@ -345,11 +343,8 @@ adminAuthRouter.post("/mfa/verify", requireAuth, mfaLimiter, async (req, res, ne
       expiresIn: "12h",
     });
     res.cookie(ADMIN_MFA_COOKIE, mfaToken, {
-      httpOnly: true,
-      sameSite: "lax",
-      secure: env.isProd,
+      ...getCookieOptions(),
       maxAge: 12 * 60 * 60 * 1000,
-      path: "/",
     });
 
     return sendOne(res, { verified: true });
@@ -363,7 +358,7 @@ adminAuthRouter.post("/mfa/verify", requireAuth, mfaLimiter, async (req, res, ne
  * Clears MFA cookie.
  */
 adminAuthRouter.post("/mfa/logout", requireAuth, (req, res) => {
-  res.clearCookie(ADMIN_MFA_COOKIE, { path: "/" });
+  clearSessionCookie(res, ADMIN_MFA_COOKIE);
   return sendOne(res, { ok: true });
 });
 

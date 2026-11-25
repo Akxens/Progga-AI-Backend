@@ -9,13 +9,31 @@ export const AUTH_COOKIE = "progga_token";
 export const GUARDIAN_COOKIE = "progga_guardian";
 export const revokedSettingKey = (userId: string) => `auth.revoked:${userId}`;
 
-export function setSessionCookie(res: Response, name: string, token: string) {
-  res.cookie(name, token, {
+export function getCookieOptions() {
+  const isSecure = env.isProd;
+  return {
     httpOnly: true,
-    sameSite: "lax",
-    secure: env.isProd,
-    maxAge: 7 * 24 * 60 * 60 * 1000,
+    sameSite: (isSecure ? "none" : "lax") as "none" | "lax",
+    secure: isSecure,
     path: "/",
+  };
+}
+
+export function setSessionCookie(res: Response, name: string, token: string) {
+  const opts = getCookieOptions();
+  res.cookie(name, token, {
+    ...opts,
+    maxAge: 7 * 24 * 60 * 60 * 1000,
+  });
+}
+
+export function clearSessionCookie(res: Response, name: string) {
+  const opts = getCookieOptions();
+  res.clearCookie(name, {
+    httpOnly: opts.httpOnly,
+    sameSite: opts.sameSite,
+    secure: opts.secure,
+    path: opts.path,
   });
 }
 
@@ -127,20 +145,53 @@ export async function requireFreshSession(req: Request, _res: Response, next: Ne
   }
 }
 
+export function isAllowedOrigin(origin: string, allowedOrigins: string[] = []): boolean {
+  if (!origin) return false;
+  const clean = origin.replace(/\/+$/, "").toLowerCase();
+
+  for (const a of allowedOrigins) {
+    const cleanAllowed = a.replace(/\/+$/, "").toLowerCase();
+    if (cleanAllowed === "*" || clean === cleanAllowed) return true;
+    if (cleanAllowed.includes("*")) {
+      const regex = new RegExp("^" + cleanAllowed.replace(/\./g, "\\.").replace(/\*/g, ".*") + "$");
+      if (regex.test(clean)) return true;
+    }
+  }
+
+  try {
+    const url = new URL(clean);
+    const host = url.hostname.toLowerCase();
+    if (
+      host === "proggaai.com" ||
+      host.endsWith(".proggaai.com") ||
+      host === "akxens.com" ||
+      host.endsWith(".akxens.com") ||
+      host === "localhost" ||
+      host === "127.0.0.1"
+    ) {
+      return true;
+    }
+  } catch {
+    return false;
+  }
+
+  return false;
+}
+
 /** Validates Origin/Referer against allowed CORS origins on cookie-authenticated mutations. */
 export function requireOrigin(allowedOrigins: string[]) {
-  const allowed = new Set(allowedOrigins.map((o) => o.replace(/\/+$/, "")));
   return (req: Request, _res: Response, next: NextFunction) => {
     if (req.method === "GET" || req.method === "HEAD" || req.method === "OPTIONS") return next();
     if (req.headers.authorization?.startsWith("Bearer ")) return next();
     if (!req.cookies?.[AUTH_COOKIE] && !req.cookies?.[GUARDIAN_COOKIE]) return next();
 
     const origin = req.get("origin");
-    if (origin) return allowed.has(origin.replace(/\/+$/, "")) ? next() : next(forbidden("Untrusted origin"));
+    if (origin) return isAllowedOrigin(origin, allowedOrigins) ? next() : next(forbidden("Untrusted origin"));
     const referer = req.get("referer");
     if (referer) {
       try {
-        return allowed.has(new URL(referer).origin) ? next() : next(forbidden("Untrusted origin"));
+        const refOrigin = new URL(referer).origin;
+        return isAllowedOrigin(refOrigin, allowedOrigins) ? next() : next(forbidden("Untrusted origin"));
       } catch {
         return next(forbidden("Untrusted origin"));
       }

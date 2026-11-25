@@ -27,7 +27,7 @@ vi.mock("../lib/prisma", () => ({
   },
 }));
 
-import { requireAuth, requireFreshSession, requireOrigin, signToken, verifyToken } from "./auth";
+import { isAllowedOrigin, requireAuth, requireFreshSession, requireOrigin, signToken, verifyToken } from "./auth";
 
 function mockReq(opts: {
   method?: string;
@@ -59,6 +59,18 @@ describe("auth origin & session revocation", () => {
     const nextGet = vi.fn();
     mw(mockReq({ method: "GET", headers: { origin: "https://evil.example" }, cookies: { progga_token: "abc" } }), {} as Response, nextGet as NextFunction);
     expect(nextGet).toHaveBeenCalledWith();
+  });
+
+  it("verifies isAllowedOrigin matches configured origins and trusted domains", () => {
+    expect(isAllowedOrigin("http://localhost:3000", ["http://localhost:3000"])).toBe(true);
+    expect(isAllowedOrigin("https://sandbox.proggaai.com")).toBe(true);
+    expect(isAllowedOrigin("https://proggaai.com")).toBe(true);
+    expect(isAllowedOrigin("https://admin.proggaai.com")).toBe(true);
+    expect(isAllowedOrigin("https://proggaapi.akxens.com")).toBe(true);
+    expect(isAllowedOrigin("http://localhost:4000")).toBe(true);
+    expect(isAllowedOrigin("http://127.0.0.1:3000")).toBe(true);
+    expect(isAllowedOrigin("https://evil.com")).toBe(false);
+    expect(isAllowedOrigin("https://notproggaai.com")).toBe(false);
   });
 
   it("rejects tokens issued before password revocation timestamp and accepts current tokens", async () => {
